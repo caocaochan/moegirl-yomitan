@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from pypinyin import Style, lazy_pinyin, load_phrases_dict
+from pypinyin import Style, lazy_pinyin
 
 from .config import Settings
 from .fetcher import load_manifest, load_record, record_path_for_page
@@ -19,10 +19,6 @@ READING_SPACE_BEFORE_PUNCTUATION_PATTERN = re.compile(r"\s+([,.:;!?%)\]}>:：；
 READING_SPACE_BEFORE_OPENING_PATTERN = re.compile(r"\s+([(\[<{（【《「『])")
 READING_SPACE_AFTER_OPENING_PATTERN = re.compile(r"([(\[<{（【《「『])\s+")
 READING_PUNCTUATION_WITH_TRAILING_SPACE_PATTERN = re.compile(r"([,.:;!?:：；，。！？、])(?=\S)")
-PINYIN_PHRASE_OVERRIDES = {
-    "姐姐": [["jiě"], ["jie"]],
-    "姐姐大人": [["jiě"], ["jie"], ["dà"], ["rén"]],
-}
 _PINYIN_DATA_READY = False
 
 
@@ -131,10 +127,9 @@ def ensure_pinyin_phrase_data_loaded() -> None:
     if _PINYIN_DATA_READY:
         return
 
-    from pypinyin_dict.phrase_pinyin_data import cc_cedict
+    from pypinyin_dict.phrase_pinyin_data import large_pinyin
 
-    cc_cedict.load()
-    load_phrases_dict(PINYIN_PHRASE_OVERRIDES)
+    large_pinyin.load()
     _PINYIN_DATA_READY = True
 
 
