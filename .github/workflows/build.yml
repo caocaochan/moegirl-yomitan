@@ -7,7 +7,7 @@ on:
       - master
   workflow_dispatch:
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "0 2 * * 1"
 
 permissions:
   contents: write
@@ -36,6 +36,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .[dev]
 
+      - name: Restore fetch cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/moegirl-yomitan
+          key: moegirl-yomitan-cache-${{ github.run_id }}
+          restore-keys: |
+            moegirl-yomitan-cache-
+
       - name: Fetch tags
         run: git fetch --force --tags
 
@@ -50,18 +58,25 @@ jobs:
         run: pytest -q -k "not smoke_build_and_package"
 
       - name: Build dictionary archive
-        run: python -m moegirl_yomitan build --output "dist/moegirl-yomitan-${{ steps.version.outputs.build_version }}.zip"
+        run: python -m moegirl_yomitan build --output dist/moegirl-yomitan.zip
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: moegirl-yomitan-${{ steps.version.outputs.build_version }}
-          path: dist/moegirl-yomitan-${{ steps.version.outputs.build_version }}.zip
+          path: dist/moegirl-yomitan.zip
+
+      - name: Save updated fetch cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/moegirl-yomitan
+          key: moegirl-yomitan-cache-${{ github.run_id }}
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ steps.version.outputs.build_version }}" "dist/moegirl-yomitan-${{ steps.version.outputs.build_version }}.zip" \
+          gh release create "${{ steps.version.outputs.build_version }}" "dist/moegirl-yomitan.zip" \
             --title "${{ steps.version.outputs.build_version }}" \
             --notes "Automated Yomitan dictionary build for version ${{ steps.version.outputs.build_version }}."

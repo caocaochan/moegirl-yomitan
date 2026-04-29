@@ -34,3 +34,12 @@ Dictionary builds use the current date as the Yomitan `revision` in `YYYY.MM.DD`
 If more than one build is released on the same day, the next build becomes
 `YYYY.MM.DD.1`, then `YYYY.MM.DD.2`, and so on. GitHub Actions computes that value from
 existing git tags and publishes a matching release artifact automatically.
+
+The automated GitHub build runs weekly on Mondays at 02:00 UTC, restores the previous
+fetch cache, refreshes entries from Moegirlpedia, and publishes the newest archive as the
+stable asset name `moegirl-yomitan.zip`.
+
+For Yomitan imports that can self-update, use this URL so the extension always checks the
+latest release asset:
+
+`https://github.com/caocaochan/moegirl-yomitan/releases/latest/download/moegirl-yomitan.zip`
