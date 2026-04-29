@@ -1,7 +1,6 @@
 # Moegirl Yomitan Builder
 
-Build a Yomitan term dictionary from public namespace-0 萌娘百科 sitemap entries,
-using only short lead summaries from the public extracts API.
+Build a Yomitan term dictionary from public 萌娘百科 sitemap entries.
 
 ## CLI
 
