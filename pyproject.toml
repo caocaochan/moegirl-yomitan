@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moegirl-yomitan"
+version = "0.1.0"
+description = "Build a Yomitan dictionary from Moegirlpedia lead summaries."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pypinyin>=0.55.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "jsonschema>=4.23.0",
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,67 @@
+name: Build dictionary
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dictionary-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+
+      - name: Fetch tags
+        run: git fetch --force --tags
+
+      - name: Resolve build version
+        id: version
+        run: |
+          build_version="$(python -c "from moegirl_yomitan.versioning import resolve_build_version; print(resolve_build_version())")"
+          echo "build_version=${build_version}" >> "$GITHUB_OUTPUT"
+          echo "MOEGIRL_YOMITAN_BUILD_VERSION=${build_version}" >> "$GITHUB_ENV"
+
+      - name: Run tests
+        run: pytest -q -k "not smoke_build_and_package"
+
+      - name: Build dictionary archive
+        run: python -m moegirl_yomitan build --output "dist/moegirl-yomitan-${{ steps.version.outputs.build_version }}.zip"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: moegirl-yomitan-${{ steps.version.outputs.build_version }}
+          path: dist/moegirl-yomitan-${{ steps.version.outputs.build_version }}.zip
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.build_version }}" "dist/moegirl-yomitan-${{ steps.version.outputs.build_version }}.zip" \
+            --title "${{ steps.version.outputs.build_version }}" \
+            --notes "Automated Yomitan dictionary build for version ${{ steps.version.outputs.build_version }}."
