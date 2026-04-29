@@ -133,6 +133,10 @@ def ensure_pinyin_phrase_data_loaded() -> None:
     _PINYIN_DATA_READY = True
 
 
+def reading_separator_text(text: str) -> str:
+    return "".join(character for character in text if not character.isalnum() and not character.isspace())
+
+
 def term_reading_for_term(term: str) -> str:
     ensure_pinyin_phrase_data_loaded()
     pieces: list[str] = []
@@ -142,7 +146,9 @@ def term_reading_for_term(term: str) -> str:
     for match in HANZI_RUN_PATTERN.finditer(term):
         start, end = match.span()
         if start > last_end:
-            pieces.append(term[last_end:start])
+            separator = reading_separator_text(term[last_end:start])
+            if separator:
+                pieces.append(separator)
 
         reading_parts = lazy_pinyin(
             match.group(),
@@ -157,7 +163,9 @@ def term_reading_for_term(term: str) -> str:
         last_end = end
 
     if last_end < len(term):
-        pieces.append(term[last_end:])
+        separator = reading_separator_text(term[last_end:])
+        if separator:
+            pieces.append(separator)
 
     if not converted_any:
         return ""

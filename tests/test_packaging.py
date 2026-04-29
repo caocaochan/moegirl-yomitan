@@ -110,6 +110,14 @@ def test_term_reading_for_term_keeps_mixed_script_punctuation_inline() -> None:
     assert term_reading_for_term("战舰少女:百眼巨人") == "zhàn jiàn shào nǚ: bǎi yǎn jù rén"
 
 
+def test_term_reading_for_term_omits_non_hanzi_words_from_mixed_titles() -> None:
+    assert term_reading_for_term("舰队Collection") == "jiàn duì"
+
+
+def test_term_reading_for_term_omits_non_hanzi_word_prefixes() -> None:
+    assert term_reading_for_term("Collection舰队") == "jiàn duì"
+
+
 def test_term_reading_for_term_uses_phrase_data_for_sister_title() -> None:
     assert term_reading_for_term("姐姐") == "jiě jie"
 
