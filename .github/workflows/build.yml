@@ -64,7 +64,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: moegirl-yomitan-${{ steps.version.outputs.build_version }}
-          path: dist/moegirl-yomitan.zip
+          path: |
+            dist/moegirl-yomitan.zip
+            dist/moegirl-yomitan-index.json
 
       - name: Save updated fetch cache
         if: always()
@@ -77,6 +79,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ steps.version.outputs.build_version }}" "dist/moegirl-yomitan.zip" \
+          gh release create "${{ steps.version.outputs.build_version }}" "dist/moegirl-yomitan.zip" "dist/moegirl-yomitan-index.json" \
             --title "${{ steps.version.outputs.build_version }}" \
             --notes "Automated Yomitan dictionary build for version ${{ steps.version.outputs.build_version }}."

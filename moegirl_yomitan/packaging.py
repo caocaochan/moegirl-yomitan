@@ -40,10 +40,15 @@ def package_dictionary(settings: Settings) -> Path:
             deduped[record.pageid] = record
 
     ordered_records = sorted(deduped.values(), key=lambda item: (item.canonical_title.casefold(), item.pageid))
+    build_version = resolve_build_version()
+    index_data = build_index(settings, revision=build_version)
+    serialized_index = json.dumps(index_data, ensure_ascii=False, indent=2)
 
     settings.output_zip.parent.mkdir(parents=True, exist_ok=True)
+    settings.output_index.parent.mkdir(parents=True, exist_ok=True)
+    settings.output_index.write_text(serialized_index, encoding="utf-8")
     with ZipFile(settings.output_zip, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
-        archive.writestr("index.json", json.dumps(build_index(settings), ensure_ascii=False, indent=2))
+        archive.writestr("index.json", serialized_index)
         for file_number, chunk in enumerate(chunked(ordered_records, settings.chunk_size), start=1):
             entries = [entry for record in chunk for entry in build_term_entries(record)]
             archive.writestr(
@@ -60,9 +65,12 @@ def build_index(settings: Settings, revision: str | None = None) -> dict:
         "format": 3,
         "revision": build_version,
         "sequenced": True,
+        "isUpdatable": True,
+        "indexUrl": settings.dictionary_update_index_url,
+        "downloadUrl": settings.dictionary_update_download_url,
         "sourceLanguage": "zh",
         "targetLanguage": "zh",
-        "url": "https://mzh.moegirl.org.cn/",
+        "url": settings.dictionary_source_url,
         "description": "来自萌娘百科的简短导语摘要词典。仅包含摘要与原文链接，不提供全文。",
         "attribution": "内容来源：萌娘百科（Moegirlpedia）。本词典仅提供摘要，非全文，请通过词条链接访问原文。",
     }

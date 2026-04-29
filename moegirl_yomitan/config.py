@@ -14,7 +14,15 @@ class Settings:
     extracts_api_url: str = "https://mzh.moegirl.org.cn/api.php"
     cache_dir: Path = Path(".cache") / "moegirl-yomitan"
     output_zip: Path = Path("dist") / "moegirl-yomitan.zip"
+    standalone_index_filename: str = "moegirl-yomitan-index.json"
     dictionary_title: str = "萌娘百科"
+    dictionary_source_url: str = "https://mzh.moegirl.org.cn/"
+    dictionary_update_index_url: str = (
+        "https://github.com/caocaochan/moegirl-yomitan/releases/latest/download/moegirl-yomitan-index.json"
+    )
+    dictionary_update_download_url: str = (
+        "https://github.com/caocaochan/moegirl-yomitan/releases/latest/download/moegirl-yomitan.zip"
+    )
     summary_char_limit: int = 240
     batch_size: int = 20
     concurrency: int = 2
@@ -31,6 +39,10 @@ class Settings:
     @property
     def manifest_path(self) -> Path:
         return self.cache_dir / "manifest.json"
+
+    @property
+    def output_index(self) -> Path:
+        return self.output_zip.with_name(self.standalone_index_filename)
 
     @property
     def records_dir(self) -> Path:
