@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import threading
 import time
 from typing import Callable, Iterable
 
@@ -25,6 +27,15 @@ from .text import normalize_whitespace, trim_summary
 CHECKPOINT_INTERVAL_SECONDS = 30.0
 CHECKPOINT_BATCH_INTERVAL = 100
 SLOW_CHECKPOINT_SECONDS = 1.0
+SESSION_POOL_BATCH = "batch"
+SESSION_POOL_SITEMAP = "sitemap"
+
+_THREAD_LOCAL = threading.local()
+_ACTIVE_SESSION_REGISTRIES: dict[str, list["SessionRegistry"]] = {
+    SESSION_POOL_BATCH: [],
+    SESSION_POOL_SITEMAP: [],
+}
+_ACTIVE_SESSION_REGISTRIES_LOCK = threading.Lock()
 
 
 def build_session(settings: Settings) -> requests.Session:
@@ -67,8 +78,86 @@ class FetchProgressState:
     new_pageids_seen: set[int] = field(default_factory=set)
 
 
+@dataclass
+class SessionRegistry:
+    sessions: list[requests.Session] = field(default_factory=list)
+    session_ids: set[int] = field(default_factory=set)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def add(self, session: requests.Session) -> None:
+        with self.lock:
+            session_id = id(session)
+            if session_id in self.session_ids:
+                return
+            self.session_ids.add(session_id)
+            self.sessions.append(session)
+
+    def close_all(self) -> None:
+        with self.lock:
+            sessions = list(self.sessions)
+            self.sessions.clear()
+            self.session_ids.clear()
+
+        for session in sessions:
+            session.close()
+
+
 def log_status(message: str) -> None:
     print(message, flush=True)
+
+
+def get_thread_session(settings: Settings, pool_name: str) -> requests.Session:
+    sessions = getattr(_THREAD_LOCAL, "sessions", None)
+    if sessions is None:
+        sessions = {}
+        _THREAD_LOCAL.sessions = sessions
+
+    session = sessions.get(pool_name)
+    if session is not None:
+        return session
+
+    session = build_session(settings)
+    sessions[pool_name] = session
+    register_active_session(pool_name, session)
+    return session
+
+
+def close_thread_session(pool_name: str) -> None:
+    sessions = getattr(_THREAD_LOCAL, "sessions", None)
+    if not sessions:
+        return
+
+    session = sessions.pop(pool_name, None)
+    if session is not None:
+        session.close()
+
+    if not sessions:
+        delattr(_THREAD_LOCAL, "sessions")
+
+
+def register_active_session(pool_name: str, session: requests.Session) -> None:
+    with _ACTIVE_SESSION_REGISTRIES_LOCK:
+        registries = _ACTIVE_SESSION_REGISTRIES.get(pool_name, [])
+        registry = registries[-1] if registries else None
+
+    if registry is not None:
+        registry.add(session)
+
+
+@contextmanager
+def session_registry_scope(pool_name: str) -> Iterable[SessionRegistry]:
+    registry = SessionRegistry()
+    with _ACTIVE_SESSION_REGISTRIES_LOCK:
+        _ACTIVE_SESSION_REGISTRIES.setdefault(pool_name, []).append(registry)
+
+    try:
+        yield registry
+    finally:
+        registry.close_all()
+        with _ACTIVE_SESSION_REGISTRIES_LOCK:
+            registries = _ACTIVE_SESSION_REGISTRIES.get(pool_name, [])
+            if registry in registries:
+                registries.remove(registry)
 
 
 def discover_pages(settings: Settings, session: requests.Session, limit: int | None = None) -> list[ManifestPage]:
@@ -234,10 +323,13 @@ def build_progress(
 
 def fetch_pages(settings: Settings, limit: int | None = None) -> list[ManifestPage]:
     session = build_session(settings)
-    log_status("Discovering sitemap pages...")
-    discover_started_at = time.monotonic()
-    pages = discover_pages(settings, session, limit=limit)
-    log_status(f"Discovered {len(pages)} pages in {time.monotonic() - discover_started_at:.1f}s.")
+    try:
+        log_status("Discovering sitemap pages...")
+        discover_started_at = time.monotonic()
+        pages = discover_pages(settings, session, limit=limit)
+        log_status(f"Discovered {len(pages)} pages in {time.monotonic() - discover_started_at:.1f}s.")
+    finally:
+        session.close()
 
     log_status("Loading record cache index...")
     index_started_at = time.monotonic()
@@ -282,46 +374,47 @@ def run_adaptive_fetch_loop(
     state = AdaptiveState(current_concurrency=max_workers)
     in_flight: dict[object, BatchTask] = {}
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        while queue or in_flight:
-            while queue and len(in_flight) < state.current_concurrency:
-                task = queue.popleft()
-                future = executor.submit(fetch_batch, settings, task.pages)
-                in_flight[future] = task
+    with session_registry_scope(SESSION_POOL_BATCH):
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            while queue or in_flight:
+                while queue and len(in_flight) < state.current_concurrency:
+                    task = queue.popleft()
+                    future = executor.submit(fetch_batch, settings, task.pages)
+                    in_flight[future] = task
 
-            if not in_flight:
-                continue
-
-            future = next(as_completed(list(in_flight.keys()), timeout=None))
-            task = in_flight.pop(future)
-            try:
-                records = future.result()
-            except requests.RequestException:
-                state = adaptive_state_after_failure(settings, state)
-                if task.attempt + 1 >= settings.batch_retry_attempts:
-                    raise
-                if state.cooldown_seconds > 0:
-                    time.sleep(state.cooldown_seconds)
-                queue.appendleft(BatchTask(task.pages, task.attempt + 1))
-                continue
-
-            for page, record in zip(task.pages, records):
-                if record is None:
+                if not in_flight:
                     continue
-                write_record(settings, record)
-                page.pageid = record.pageid
-                page.canonical_title = record.canonical_title
-                page.article_url = record.article_url
-                page.record_path = record_path_for_page(settings, record.pageid).relative_to(settings.cache_dir).as_posix()
-                progress_state.records_fetched += 1
-                if record.pageid not in record_index.by_pageid:
-                    progress_state.new_pageids_seen.add(record.pageid)
 
-            progress_state.successful_batches += 1
-            progress_state.batches_since_checkpoint += 1
-            progress_state.pending_pages_remaining = max(0, progress_state.pending_pages_remaining - len(task.pages))
-            save_manifest_checkpoint(settings, all_pages, progress_state)
-            state = adaptive_state_after_success(settings, state)
+                future = next(as_completed(list(in_flight.keys()), timeout=None))
+                task = in_flight.pop(future)
+                try:
+                    records = future.result()
+                except requests.RequestException:
+                    state = adaptive_state_after_failure(settings, state)
+                    if task.attempt + 1 >= settings.batch_retry_attempts:
+                        raise
+                    if state.cooldown_seconds > 0:
+                        time.sleep(state.cooldown_seconds)
+                    queue.appendleft(BatchTask(task.pages, task.attempt + 1))
+                    continue
+
+                for page, record in zip(task.pages, records):
+                    if record is None:
+                        continue
+                    write_record(settings, record)
+                    page.pageid = record.pageid
+                    page.canonical_title = record.canonical_title
+                    page.article_url = record.article_url
+                    page.record_path = record_path_for_page(settings, record.pageid).relative_to(settings.cache_dir).as_posix()
+                    progress_state.records_fetched += 1
+                    if record.pageid not in record_index.by_pageid:
+                        progress_state.new_pageids_seen.add(record.pageid)
+
+                progress_state.successful_batches += 1
+                progress_state.batches_since_checkpoint += 1
+                progress_state.pending_pages_remaining = max(0, progress_state.pending_pages_remaining - len(task.pages))
+                save_manifest_checkpoint(settings, all_pages, progress_state)
+                state = adaptive_state_after_success(settings, state)
 
 
 def save_manifest_checkpoint(
@@ -372,7 +465,7 @@ def should_checkpoint(progress_state: FetchProgressState, now: float) -> bool:
 
 
 def fetch_batch(settings: Settings, batch: list[ManifestPage]) -> list[SummaryRecord | None]:
-    session = build_session(settings)
+    session = get_thread_session(settings, SESSION_POOL_BATCH)
     return fetch_batch_with_session(session, settings, batch)
 
 
@@ -443,19 +536,21 @@ def fetch_sitemaps_in_parallel(settings: Settings, sitemap_urls: list[str]) -> d
 
     workers = max(1, min(settings.sitemap_concurrency, len(sitemap_urls)))
     if workers == 1:
-        return {url: fetch_sitemap_worker(settings, url) for url in sitemap_urls}
+        with session_registry_scope(SESSION_POOL_SITEMAP):
+            return {url: fetch_sitemap_worker(settings, url) for url in sitemap_urls}
 
     results: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(fetch_sitemap_worker, settings, url): url for url in sitemap_urls}
-        for future in as_completed(futures):
-            url = futures[future]
-            results[url] = future.result()
+    with session_registry_scope(SESSION_POOL_SITEMAP):
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(fetch_sitemap_worker, settings, url): url for url in sitemap_urls}
+            for future in as_completed(futures):
+                url = futures[future]
+                results[url] = future.result()
     return results
 
 
 def fetch_sitemap_worker(settings: Settings, url: str) -> str:
-    session = build_session(settings)
+    session = get_thread_session(settings, SESSION_POOL_SITEMAP)
     return fetch_sitemap_text_with_fallback(session, url, settings)
 
 
