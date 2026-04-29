@@ -22,6 +22,15 @@ from moegirl_yomitan.fetcher import (
 from moegirl_yomitan.models import ManifestPage, SummaryRecord
 
 
+@pytest.fixture(autouse=True)
+def clear_thread_local_sessions() -> None:
+    fetcher.close_thread_session(fetcher.SESSION_POOL_BATCH)
+    fetcher.close_thread_session(fetcher.SESSION_POOL_SITEMAP)
+    yield
+    fetcher.close_thread_session(fetcher.SESSION_POOL_BATCH)
+    fetcher.close_thread_session(fetcher.SESSION_POOL_SITEMAP)
+
+
 def make_page(lastmod: str = "2026-04-28T00:00:00Z") -> ManifestPage:
     return make_page_with_title("萌娘", lastmod=lastmod)
 
@@ -302,6 +311,166 @@ def test_fetch_batch_single_page_oversize_error_is_raised(monkeypatch) -> None:
 
     with pytest.raises(requests.HTTPError):
         fetcher.fetch_batch(settings, [page])
+
+
+def test_fetch_batch_reuses_one_session_per_thread(monkeypatch) -> None:
+    settings = Settings()
+    created_sessions: list[object] = []
+
+    class DummySession:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def fake_build_session(settings: Settings) -> DummySession:
+        session = DummySession()
+        created_sessions.append(session)
+        return session
+
+    def fake_fetch_extract_payload(session, settings, titles: list[str]) -> dict:
+        return {
+            "query": {
+                "pages": {
+                    "1": {
+                        "pageid": 1,
+                        "title": titles[0],
+                        "extract": f"{titles[0]} 摘要",
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr(fetcher, "build_session", fake_build_session)
+    monkeypatch.setattr(fetcher, "fetch_extract_payload", fake_fetch_extract_payload)
+
+    first = fetcher.fetch_batch(settings, [make_page_with_title("甲")])
+    second = fetcher.fetch_batch(settings, [make_page_with_title("乙")])
+
+    assert [record.canonical_title if record else None for record in first] == ["甲"]
+    assert [record.canonical_title if record else None for record in second] == ["乙"]
+    assert len(created_sessions) == 1
+    assert created_sessions[0].close_calls == 0
+
+    fetcher.close_thread_session(fetcher.SESSION_POOL_BATCH)
+
+    assert created_sessions[0].close_calls == 1
+
+
+def test_run_adaptive_fetch_loop_closes_batch_worker_sessions(monkeypatch) -> None:
+    settings = Settings(cache_dir=Path("unused-cache"), batch_size=1, concurrency=1)
+    pages = [make_page_with_title("甲"), make_page_with_title("乙")]
+    batches = [[pages[0]], [pages[1]]]
+    created_sessions: list[object] = []
+
+    class DummySession:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def fake_build_session(settings: Settings) -> DummySession:
+        session = DummySession()
+        created_sessions.append(session)
+        return session
+
+    def fake_fetch_batch_with_session(session, settings: Settings, batch: list[ManifestPage]) -> list[SummaryRecord | None]:
+        page = batch[0]
+        pageid = 1 if page.title_from_url == "甲" else 2
+        return [make_record_for_page(page, pageid=pageid)]
+
+    progress_state = fetcher.FetchProgressState(
+        cached_records_seen=0,
+        pages_hydrated_from_records=0,
+        pending_pages_remaining=len(pages),
+        fetch_started_at=time.monotonic(),
+        last_checkpoint_at=time.monotonic(),
+    )
+
+    monkeypatch.setattr(fetcher, "build_session", fake_build_session)
+    monkeypatch.setattr(fetcher, "fetch_batch_with_session", fake_fetch_batch_with_session)
+    monkeypatch.setattr(fetcher, "write_record", lambda settings, record: None)
+    monkeypatch.setattr(fetcher, "save_manifest_checkpoint", lambda *args, **kwargs: None)
+
+    fetcher.run_adaptive_fetch_loop(
+        settings,
+        pages,
+        batches,
+        progress_state,
+        fetcher.RecordCacheIndex({}, {}, {}, 0),
+    )
+
+    assert len(created_sessions) == 1
+    assert created_sessions[0].close_calls == 1
+
+
+def test_fetch_sitemap_worker_reuses_one_session_per_thread(monkeypatch) -> None:
+    settings = Settings()
+    created_sessions: list[object] = []
+
+    class DummySession:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def fake_build_session(settings: Settings) -> DummySession:
+        session = DummySession()
+        created_sessions.append(session)
+        return session
+
+    monkeypatch.setattr(fetcher, "build_session", fake_build_session)
+    monkeypatch.setattr(fetcher, "fetch_sitemap_text_with_fallback", lambda session, url, settings: f"<xml>{url}</xml>")
+
+    first = fetcher.fetch_sitemap_worker(settings, "https://example.invalid/sitemap-1.xml")
+    second = fetcher.fetch_sitemap_worker(settings, "https://example.invalid/sitemap-2.xml")
+
+    assert first == "<xml>https://example.invalid/sitemap-1.xml</xml>"
+    assert second == "<xml>https://example.invalid/sitemap-2.xml</xml>"
+    assert len(created_sessions) == 1
+    assert created_sessions[0].close_calls == 0
+
+    fetcher.close_thread_session(fetcher.SESSION_POOL_SITEMAP)
+
+    assert created_sessions[0].close_calls == 1
+
+
+def test_fetch_sitemaps_in_parallel_closes_worker_sessions(monkeypatch) -> None:
+    settings = Settings(sitemap_concurrency=1)
+    created_sessions: list[object] = []
+
+    class DummySession:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def fake_build_session(settings: Settings) -> DummySession:
+        session = DummySession()
+        created_sessions.append(session)
+        return session
+
+    monkeypatch.setattr(fetcher, "build_session", fake_build_session)
+    monkeypatch.setattr(fetcher, "fetch_sitemap_text_with_fallback", lambda session, url, settings: f"<xml>{url}</xml>")
+
+    results = fetcher.fetch_sitemaps_in_parallel(
+        settings,
+        [
+            "https://example.invalid/sitemap-1.xml",
+            "https://example.invalid/sitemap-2.xml",
+        ],
+    )
+
+    assert results == {
+        "https://example.invalid/sitemap-1.xml": "<xml>https://example.invalid/sitemap-1.xml</xml>",
+        "https://example.invalid/sitemap-2.xml": "<xml>https://example.invalid/sitemap-2.xml</xml>",
+    }
+    assert len(created_sessions) == 1
+    assert created_sessions[0].close_calls == 1
 
 
 def test_fetch_pages_throttles_manifest_checkpoints(tmp_path: Path, monkeypatch) -> None:
