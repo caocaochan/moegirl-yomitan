@@ -11,6 +11,8 @@ from moegirl_yomitan.fetcher import AdaptiveState, adaptive_state_after_failure,
 from moegirl_yomitan.models import ManifestPage, SummaryRecord
 from moegirl_yomitan.packaging import (
     alias_term_for_title,
+    build_dictionary_content_fingerprint,
+    build_dictionary_content_payload,
     build_index,
     build_term_entries,
     build_term_entry,
@@ -140,6 +142,15 @@ def test_build_index_uses_current_date_for_version_fields() -> None:
     assert "version" not in index
 
 
+def test_dictionary_content_payload_omits_revision_field(tmp_path: Path) -> None:
+    settings = Settings(
+        cache_dir=tmp_path / "cache",
+        output_zip=tmp_path / "dist" / "moegirl.zip",
+    )
+    payload = build_dictionary_content_payload(settings)
+    assert "revision" not in payload["index"]
+
+
 def test_next_build_version_uses_plain_date_for_first_build() -> None:
     assert next_build_version(existing_versions=[], today=date(2026, 4, 29)) == "2026.04.29"
 
@@ -228,41 +239,7 @@ def test_smoke_build_and_package(tmp_path: Path) -> None:
 
 def test_package_dictionary_writes_zip_and_standalone_index_with_shared_revision(tmp_path: Path, monkeypatch) -> None:
     pytest.importorskip("jsonschema")
-    settings = Settings(
-        cache_dir=tmp_path / "cache",
-        output_zip=tmp_path / "dist" / "moegirl.zip",
-        batch_size=3,
-        concurrency=1,
-    )
-    page = ManifestPage(
-        source_url="https://mzh.moegirl.org.cn/%E8%90%8C%E5%A8%98",
-        title_from_url="萌娘",
-        lastmod="2026-04-28T00:00:00Z",
-        sitemap_url="https://mzh.moegirl.org.cn/sitemap/page.xml",
-        pageid=1,
-        canonical_title="萌娘",
-        article_url="https://mzh.moegirl.org.cn/%E8%90%8C%E5%A8%98",
-        record_path="records/1.json",
-    )
-    record = SummaryRecord(
-        pageid=1,
-        canonical_title="萌娘",
-        article_url="https://mzh.moegirl.org.cn/%E8%90%8C%E5%A8%98",
-        source_url="https://mzh.moegirl.org.cn/%E8%90%8C%E5%A8%98",
-        lastmod="2026-04-28T00:00:00Z",
-        summary="这是摘要。",
-        retrieved_at=datetime.now(timezone.utc).isoformat(),
-    )
-    settings.cache_dir.mkdir(parents=True, exist_ok=True)
-    settings.records_dir.mkdir(parents=True, exist_ok=True)
-    settings.manifest_path.write_text(
-        json.dumps({"pages": [page.to_dict()]}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    settings.records_dir.joinpath("1.json").write_text(
-        json.dumps(record.to_dict(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    settings = write_single_page_cache(tmp_path)
     monkeypatch.setattr("moegirl_yomitan.packaging.resolve_build_version", lambda: "2026.04.29.2")
 
     output_path = package_dictionary(settings)
@@ -283,6 +260,33 @@ def test_package_dictionary_writes_zip_and_standalone_index_with_shared_revision
     validate_index_against_official_schema(standalone_index_data)
     assert index_data == standalone_index_data
     assert index_data["revision"] == "2026.04.29.2"
+
+
+def test_dictionary_content_fingerprint_ignores_retrieved_at(tmp_path: Path) -> None:
+    first = write_single_page_cache(
+        tmp_path / "first",
+        retrieved_at="2026-04-28T12:00:00+00:00",
+    )
+    second = write_single_page_cache(
+        tmp_path / "second",
+        retrieved_at="2026-04-29T12:00:00+00:00",
+    )
+
+    assert build_dictionary_content_fingerprint(first) == build_dictionary_content_fingerprint(second)
+
+
+def test_dictionary_content_fingerprint_changes_when_summary_changes(tmp_path: Path) -> None:
+    first = write_single_page_cache(tmp_path / "first", summary="这是摘要。")
+    second = write_single_page_cache(tmp_path / "second", summary="这是新摘要。")
+
+    assert build_dictionary_content_fingerprint(first) != build_dictionary_content_fingerprint(second)
+
+
+def test_dictionary_content_fingerprint_changes_when_alias_output_changes(tmp_path: Path) -> None:
+    first = write_single_page_cache(tmp_path / "first", canonical_title="绿坝娘（和谐大色狼）")
+    second = write_single_page_cache(tmp_path / "second", canonical_title="绿坝娘")
+
+    assert build_dictionary_content_fingerprint(first) != build_dictionary_content_fingerprint(second)
 
 
 def validate_against_official_schema(index_data: dict, term_data: list) -> None:
@@ -309,3 +313,49 @@ def load_official_index_schema() -> dict:
         "https://raw.githubusercontent.com/yomidevs/yomitan/refs/heads/master/ext/data/schemas/dictionary-index-schema.json",
         timeout=30,
     ).json()
+
+
+def write_single_page_cache(
+    tmp_path: Path,
+    *,
+    canonical_title: str = "萌娘",
+    summary: str = "这是摘要。",
+    retrieved_at: str | None = None,
+) -> Settings:
+    settings = Settings(
+        cache_dir=tmp_path / "cache",
+        output_zip=tmp_path / "dist" / "moegirl.zip",
+        batch_size=3,
+        concurrency=1,
+    )
+    source_url = "https://mzh.moegirl.org.cn/%E8%90%8C%E5%A8%98"
+    page = ManifestPage(
+        source_url=source_url,
+        title_from_url=canonical_title,
+        lastmod="2026-04-28T00:00:00Z",
+        sitemap_url="https://mzh.moegirl.org.cn/sitemap/page.xml",
+        pageid=1,
+        canonical_title=canonical_title,
+        article_url=source_url,
+        record_path="records/1.json",
+    )
+    record = SummaryRecord(
+        pageid=1,
+        canonical_title=canonical_title,
+        article_url=source_url,
+        source_url=source_url,
+        lastmod="2026-04-28T00:00:00Z",
+        summary=summary,
+        retrieved_at=retrieved_at or datetime.now(timezone.utc).isoformat(),
+    )
+    settings.cache_dir.mkdir(parents=True, exist_ok=True)
+    settings.records_dir.mkdir(parents=True, exist_ok=True)
+    settings.manifest_path.write_text(
+        json.dumps({"pages": [page.to_dict()]}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    settings.records_dir.joinpath("1.json").write_text(
+        json.dumps(record.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return settings

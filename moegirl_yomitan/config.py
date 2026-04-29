@@ -45,5 +45,9 @@ class Settings:
         return self.output_zip.with_name(self.standalone_index_filename)
 
     @property
+    def build_state_path(self) -> Path:
+        return self.cache_dir / "build-state.json"
+
+    @property
     def records_dir(self) -> Path:
         return self.cache_dir / "records"

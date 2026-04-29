@@ -44,29 +44,56 @@ jobs:
           restore-keys: |
             moegirl-yomitan-cache-
 
+      - name: Refresh fetched data
+        run: python -m moegirl_yomitan fetch
+
+      - name: Detect packaged content changes
+        id: change
+        run: |
+          python -m moegirl_yomitan check-build-change | tee "$RUNNER_TEMP/build-change.txt"
+          while IFS='=' read -r key value; do
+            echo "$key=$value" >> "$GITHUB_OUTPUT"
+          done < "$RUNNER_TEMP/build-change.txt"
+
+      - name: Skip automatic build when content is unchanged
+        if: ${{ github.event_name != 'workflow_dispatch' && steps.change.outputs.changed != 'true' }}
+        run: echo "Skipping automatic build because packaged dictionary content is unchanged."
+
       - name: Fetch tags
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.change.outputs.changed == 'true' }}
         run: git fetch --force --tags
 
       - name: Resolve build version
         id: version
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.change.outputs.changed == 'true' }}
         run: |
           build_version="$(python -c "from moegirl_yomitan.versioning import resolve_build_version; print(resolve_build_version())")"
           echo "build_version=${build_version}" >> "$GITHUB_OUTPUT"
           echo "MOEGIRL_YOMITAN_BUILD_VERSION=${build_version}" >> "$GITHUB_ENV"
 
       - name: Run tests
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.change.outputs.changed == 'true' }}
         run: pytest -q -k "not smoke_build_and_package"
 
       - name: Build dictionary archive
-        run: python -m moegirl_yomitan build --output dist/moegirl-yomitan.zip
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.change.outputs.changed == 'true' }}
+        run: python -m moegirl_yomitan build --from-cache --output dist/moegirl-yomitan.zip
 
       - name: Upload workflow artifact
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.change.outputs.changed == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: moegirl-yomitan-${{ steps.version.outputs.build_version }}
           path: |
             dist/moegirl-yomitan.zip
             dist/moegirl-yomitan-index.json
+
+      - name: Persist build fingerprint
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.change.outputs.changed == 'true' }}
+        env:
+          BUILD_FINGERPRINT: ${{ steps.change.outputs.fingerprint }}
+        run: |
+          python -c "from moegirl_yomitan.config import Settings; from moegirl_yomitan.packaging import save_build_state; import os; save_build_state(Settings(), os.environ['BUILD_FINGERPRINT'])"
 
       - name: Save updated fetch cache
         if: always()
@@ -76,6 +103,7 @@ jobs:
           key: moegirl-yomitan-cache-${{ github.run_id }}
 
       - name: Create GitHub release
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.change.outputs.changed == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

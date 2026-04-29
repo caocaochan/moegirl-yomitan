@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -8,7 +9,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from pypinyin import Style, lazy_pinyin
 
 from .config import Settings
-from .fetcher import load_manifest, load_record, record_path_for_page
+from .fetcher import atomic_write_text, load_manifest, load_record, record_path_for_page
 from .models import SummaryRecord
 from .versioning import resolve_build_version
 
@@ -23,19 +24,7 @@ _PINYIN_DATA_READY = False
 
 
 def package_dictionary(settings: Settings) -> Path:
-    manifest_pages = load_manifest(settings)
-    deduped: dict[int, SummaryRecord] = {}
-    for page in manifest_pages:
-        if page.pageid is None:
-            continue
-        record = load_record(record_path_for_page(settings, page.pageid))
-        if record is None or record.lastmod != page.lastmod:
-            continue
-        existing = deduped.get(record.pageid)
-        if existing is None or (record.canonical_title, record.pageid) < (existing.canonical_title, existing.pageid):
-            deduped[record.pageid] = record
-
-    ordered_records = sorted(deduped.values(), key=lambda item: (item.canonical_title.casefold(), item.pageid))
+    ordered_records = load_packaged_records(settings)
     build_version = resolve_build_version()
     index_data = build_index(settings, revision=build_version)
     serialized_index = json.dumps(index_data, ensure_ascii=False, indent=2)
@@ -52,6 +41,66 @@ def package_dictionary(settings: Settings) -> Path:
                 json.dumps(entries, ensure_ascii=False, separators=(",", ":")),
             )
     return settings.output_zip
+
+
+def load_packaged_records(settings: Settings) -> list[SummaryRecord]:
+    manifest_pages = load_manifest(settings)
+    deduped: dict[int, SummaryRecord] = {}
+    for page in manifest_pages:
+        if page.pageid is None:
+            continue
+        record = load_record(record_path_for_page(settings, page.pageid))
+        if record is None or record.lastmod != page.lastmod:
+            continue
+        existing = deduped.get(record.pageid)
+        if existing is None or (record.canonical_title, record.pageid) < (existing.canonical_title, existing.pageid):
+            deduped[record.pageid] = record
+
+    return sorted(deduped.values(), key=lambda item: (item.canonical_title.casefold(), item.pageid))
+
+
+def build_dictionary_content_fingerprint(settings: Settings) -> str:
+    payload = build_dictionary_content_payload(settings)
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def build_dictionary_content_payload(settings: Settings) -> dict:
+    records = load_packaged_records(settings)
+    term_banks = []
+    for chunk in chunked(records, settings.chunk_size):
+        term_banks.append([entry for record in chunk for entry in build_term_entries(record)])
+
+    return {
+        "index": build_stable_index_data(settings),
+        "termBanks": term_banks,
+    }
+
+
+def build_stable_index_data(settings: Settings) -> dict:
+    index_data = build_index(settings, revision="build-fingerprint")
+    index_data.pop("revision", None)
+    return index_data
+
+
+def load_build_state(settings: Settings) -> dict:
+    if not settings.build_state_path.exists():
+        return {}
+    data = json.loads(settings.build_state_path.read_text(encoding="utf-8"))
+    return data if isinstance(data, dict) else {}
+
+
+def load_last_build_fingerprint(settings: Settings) -> str | None:
+    fingerprint = load_build_state(settings).get("content_fingerprint")
+    return fingerprint if isinstance(fingerprint, str) and fingerprint else None
+
+
+def save_build_state(settings: Settings, fingerprint: str) -> None:
+    settings.cache_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(
+        settings.build_state_path,
+        json.dumps({"content_fingerprint": fingerprint}, ensure_ascii=False, indent=2),
+    )
 
 
 def build_index(settings: Settings, revision: str | None = None) -> dict:

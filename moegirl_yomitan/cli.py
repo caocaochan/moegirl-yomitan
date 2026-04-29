@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .config import Settings
 from .fetcher import fetch_pages
-from .packaging import package_dictionary
+from .packaging import build_dictionary_content_fingerprint, load_last_build_fingerprint, package_dictionary
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -20,7 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rebuild the dictionary archive from the existing cache without fetching new entries.",
     )
 
-    for command in ("fetch", "package"):
+    for command in ("fetch", "package", "check-build-change"):
         subparser = subparsers.add_parser(command)
         add_common_arguments(subparser)
 
@@ -63,6 +63,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "package":
         output_path = package_dictionary(settings)
         print(f"Wrote dictionary archive to {output_path}")
+        return 0
+
+    if args.command == "check-build-change":
+        fingerprint = build_dictionary_content_fingerprint(settings)
+        previous_fingerprint = load_last_build_fingerprint(settings)
+        changed = previous_fingerprint != fingerprint
+        print(f"changed={'true' if changed else 'false'}")
+        print(f"fingerprint={fingerprint}")
         return 0
 
     if args.from_cache:
