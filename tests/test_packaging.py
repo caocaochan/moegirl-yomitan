@@ -109,6 +109,14 @@ def test_term_reading_for_term_keeps_mixed_script_punctuation_inline() -> None:
     assert term_reading_for_term("战舰少女:百眼巨人") == "zhàn jiàn shào nǚ: bǎi yǎn jù rén"
 
 
+def test_term_reading_for_term_uses_phrase_data_for_sister_title() -> None:
+    assert term_reading_for_term("姐姐") == "jiě jie"
+
+
+def test_term_reading_for_term_preserves_phrase_reading_with_longer_terms() -> None:
+    assert term_reading_for_term("姐姐大人") == "jiě jie dà rén"
+
+
 def test_term_reading_for_term_returns_empty_when_no_hanzi_are_present() -> None:
     assert term_reading_for_term("Argus") == ""
 

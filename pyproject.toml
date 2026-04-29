@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "pypinyin>=0.55.0",
+    "pypinyin-dict>=0.9.0",
     "requests>=2.31.0",
 ]
 
