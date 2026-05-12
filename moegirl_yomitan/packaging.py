@@ -20,6 +20,7 @@ READING_SPACE_BEFORE_PUNCTUATION_PATTERN = re.compile(r"\s+([,.:;!?%)\]}>:：；
 READING_SPACE_BEFORE_OPENING_PATTERN = re.compile(r"\s+([(\[<{（【《「『])")
 READING_SPACE_AFTER_OPENING_PATTERN = re.compile(r"([(\[<{（【《「『])\s+")
 READING_PUNCTUATION_WITH_TRAILING_SPACE_PATTERN = re.compile(r"([,.:;!?:：；，。！？、])(?=\S)")
+STRUCTURED_CONTENT_LANG = "zh-Hans"
 _PINYIN_DATA_READY = False
 
 
@@ -144,9 +145,10 @@ def build_term_entry_for_term(record: SummaryRecord, term: str, score: int = 0) 
             {
                 "type": "structured-content",
                 "content": [
-                    {"tag": "div", "content": [record.summary]},
+                    {"tag": "div", "lang": STRUCTURED_CONTENT_LANG, "content": [record.summary]},
                     {
                         "tag": "div",
+                        "lang": STRUCTURED_CONTENT_LANG,
                         "content": [
                             "来源：萌娘百科（摘要，非全文）。",
                             {"tag": "a", "href": record.article_url, "content": ["查看原文"]},

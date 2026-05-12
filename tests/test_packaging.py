@@ -37,6 +37,9 @@ def test_build_term_entry_has_expected_shape() -> None:
     assert entry[1] == "méng niáng"
     assert entry[2] == ""
     assert entry[5][0]["type"] == "structured-content"
+    content = entry[5][0]["content"]
+    assert content[0]["lang"] == "zh-Hans"
+    assert content[1]["lang"] == "zh-Hans"
     assert entry[6] == 1
 
 
