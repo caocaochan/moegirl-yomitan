@@ -31,12 +31,45 @@ does not download or refresh entries.
 
 Dictionary builds use the current date as the Yomitan `revision` in `YYYY.MM.DD` format.
 If more than one build is released on the same day, the next build becomes
-`YYYY.MM.DD.1`, then `YYYY.MM.DD.2`, and so on. GitHub Actions computes that value from
-existing git tags and publishes a matching release artifact automatically.
+`YYYY.MM.DD.1`, then `YYYY.MM.DD.2`, and so on. The release version is computed from
+existing git tags.
 
-The automated GitHub build runs weekly on Mondays at 02:00 UTC, restores the previous
-fetch cache, refreshes entries from Moegirlpedia, and publishes the newest archive as the
-stable asset name `moegirl-yomitan.zip`.
+## Manual release
+
+GitHub-hosted runners can be blocked by Moegirlpedia's Cloudflare challenge when fetching
+sitemap XML. Releases are therefore built from a local or otherwise non-blocked
+environment.
+
+Refresh the local cache and check whether the packaged dictionary changed:
+
+```bash
+git fetch --force --tags
+python -m moegirl_yomitan fetch --retry-attempts 8 --request-timeout 240 --backoff-base-seconds 2
+python -m moegirl_yomitan check-build-change
+python -c "from moegirl_yomitan.versioning import resolve_build_version; print(resolve_build_version())"
+```
+
+If `check-build-change` prints `changed=false`, no release is needed.
+
+Package a changed build with the resolved version. In PowerShell:
+
+```powershell
+$env:MOEGIRL_YOMITAN_BUILD_VERSION="<version>"
+python -m moegirl_yomitan build --from-cache --output dist/moegirl-yomitan.zip
+```
+
+In Bash:
+
+```bash
+export MOEGIRL_YOMITAN_BUILD_VERSION="<version>"
+python -m moegirl_yomitan build --from-cache --output dist/moegirl-yomitan.zip
+```
+
+Publish the stable release assets with GitHub CLI:
+
+```bash
+gh release create "<version>" "dist/moegirl-yomitan.zip" "dist/moegirl-yomitan-index.json" --title "<version>" --notes "Manual Yomitan dictionary build for version <version>."
+```
 
 For Yomitan imports that can self-update, use this URL so the extension always checks the
 latest release asset:
