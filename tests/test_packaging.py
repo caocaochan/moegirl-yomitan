@@ -16,6 +16,7 @@ from moegirl_yomitan.packaging import (
     build_index,
     build_term_entries,
     build_term_entry,
+    save_build_state,
     package_dictionary,
     term_reading_for_term,
 )
@@ -292,6 +293,82 @@ def test_dictionary_content_fingerprint_changes_when_alias_output_changes(tmp_pa
     assert build_dictionary_content_fingerprint(first) != build_dictionary_content_fingerprint(second)
 
 
+def test_dictionary_content_fingerprint_reuses_cached_record_fingerprint(tmp_path: Path, monkeypatch) -> None:
+    settings = write_single_page_cache(tmp_path)
+    fingerprint = build_dictionary_content_fingerprint(settings)
+    save_build_state(settings, fingerprint)
+
+    def fail_build_term_entries(record):
+        raise AssertionError("unchanged record should reuse cached fingerprint")
+
+    monkeypatch.setattr("moegirl_yomitan.packaging.build_term_entries", fail_build_term_entries)
+
+    assert build_dictionary_content_fingerprint(settings) == fingerprint
+
+
+def test_dictionary_content_fingerprint_recomputes_only_changed_record(tmp_path: Path, monkeypatch) -> None:
+    settings = write_single_page_cache(tmp_path)
+    append_cache_record(settings, pageid=2, canonical_title="测试娘", summary="旧摘要。")
+    save_build_state(settings, build_dictionary_content_fingerprint(settings))
+    append_cache_record(settings, pageid=2, canonical_title="测试娘", summary="这是新的摘要。")
+
+    calls: list[int] = []
+    original_build_term_entries = build_term_entries
+
+    def tracking_build_term_entries(record):
+        calls.append(record.pageid)
+        return original_build_term_entries(record)
+
+    monkeypatch.setattr("moegirl_yomitan.packaging.build_term_entries", tracking_build_term_entries)
+
+    build_dictionary_content_fingerprint(settings)
+
+    assert calls == [2]
+
+
+def test_dictionary_content_fingerprint_recomputes_when_lastmod_changes(tmp_path: Path, monkeypatch) -> None:
+    settings = write_single_page_cache(tmp_path)
+    save_build_state(settings, build_dictionary_content_fingerprint(settings))
+    rewrite_single_page_cache(settings, lastmod="2026-04-29T00:00:00Z")
+    calls: list[int] = []
+    original_build_term_entries = build_term_entries
+
+    def tracking_build_term_entries(record):
+        calls.append(record.pageid)
+        return original_build_term_entries(record)
+
+    monkeypatch.setattr("moegirl_yomitan.packaging.build_term_entries", tracking_build_term_entries)
+
+    build_dictionary_content_fingerprint(settings)
+
+    assert calls == [1]
+
+
+def test_dictionary_content_fingerprint_recomputes_when_algorithm_changes(tmp_path: Path, monkeypatch) -> None:
+    settings = write_single_page_cache(tmp_path)
+    save_build_state(settings, build_dictionary_content_fingerprint(settings))
+    calls: list[int] = []
+    original_build_term_entries = build_term_entries
+
+    def tracking_build_term_entries(record):
+        calls.append(record.pageid)
+        return original_build_term_entries(record)
+
+    monkeypatch.setattr("moegirl_yomitan.packaging.FINGERPRINT_ALGORITHM_VERSION", "packaged-content-test")
+    monkeypatch.setattr("moegirl_yomitan.packaging.build_term_entries", tracking_build_term_entries)
+
+    build_dictionary_content_fingerprint(settings)
+
+    assert calls == [1]
+
+
+def test_dictionary_content_fingerprint_ignores_malformed_build_state(tmp_path: Path) -> None:
+    settings = write_single_page_cache(tmp_path)
+    settings.build_state_path.write_text("{not json", encoding="utf-8")
+
+    assert build_dictionary_content_fingerprint(settings)
+
+
 def validate_against_official_schema(index_data: dict, term_data: list) -> None:
     import jsonschema
 
@@ -362,3 +439,53 @@ def write_single_page_cache(
         encoding="utf-8",
     )
     return settings
+
+
+def append_cache_record(
+    settings: Settings,
+    *,
+    pageid: int,
+    canonical_title: str,
+    summary: str,
+    lastmod: str = "2026-04-28T00:00:00Z",
+) -> None:
+    manifest = json.loads(settings.manifest_path.read_text(encoding="utf-8"))
+    source_url = f"https://mzh.moegirl.org.cn/{pageid}"
+    page = ManifestPage(
+        source_url=source_url,
+        title_from_url=canonical_title,
+        lastmod=lastmod,
+        sitemap_url="https://mzh.moegirl.org.cn/sitemap/page.xml",
+        pageid=pageid,
+        canonical_title=canonical_title,
+        article_url=source_url,
+        record_path=f"records/{pageid}.json",
+    )
+    record = SummaryRecord(
+        pageid=pageid,
+        canonical_title=canonical_title,
+        article_url=source_url,
+        source_url=source_url,
+        lastmod=lastmod,
+        summary=summary,
+        retrieved_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    manifest["pages"] = [item for item in manifest["pages"] if item.get("pageid") != pageid]
+    manifest["pages"].append(page.to_dict())
+    settings.manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    settings.records_dir.joinpath(f"{pageid}.json").write_text(
+        json.dumps(record.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def rewrite_single_page_cache(settings: Settings, *, lastmod: str) -> None:
+    manifest = json.loads(settings.manifest_path.read_text(encoding="utf-8"))
+    manifest["pages"][0]["lastmod"] = lastmod
+    settings.manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    record_path = settings.records_dir.joinpath("1.json")
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["lastmod"] = lastmod
+    record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")

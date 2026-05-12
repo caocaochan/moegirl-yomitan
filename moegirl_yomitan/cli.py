@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 
 from .config import Settings
 from .fetcher import fetch_pages
-from .packaging import build_dictionary_content_fingerprint, load_last_build_fingerprint, package_dictionary
+from .packaging import build_dictionary_content_fingerprint, load_last_build_fingerprint, package_dictionary, save_build_state
 
 
 def positive_float(value: str) -> float:
@@ -37,6 +38,10 @@ def build_parser() -> argparse.ArgumentParser:
     for command in ("fetch", "package", "check-build-change"):
         subparser = subparsers.add_parser(command)
         add_common_arguments(subparser)
+
+    save_state_parser = subparsers.add_parser("save-build-state")
+    add_common_arguments(save_state_parser)
+    save_state_parser.add_argument("--fingerprint", required=True, help="Released content fingerprint to store.")
 
     return parser
 
@@ -86,11 +91,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "check-build-change":
-        fingerprint = build_dictionary_content_fingerprint(settings)
+        fingerprint = build_dictionary_content_fingerprint(settings, progress=progress_to_stderr)
         previous_fingerprint = load_last_build_fingerprint(settings)
         changed = previous_fingerprint != fingerprint
         print(f"changed={'true' if changed else 'false'}")
         print(f"fingerprint={fingerprint}")
+        return 0
+
+    if args.command == "save-build-state":
+        save_build_state(settings, args.fingerprint, progress=progress_to_stderr)
+        print(f"Saved build state for fingerprint {args.fingerprint}")
         return 0
 
     if args.from_cache:
@@ -102,3 +112,7 @@ def main(argv: list[str] | None = None) -> int:
     output_path = package_dictionary(settings)
     print(f"Built dictionary archive from {len(pages)} discovered pages: {output_path}")
     return 0
+
+
+def progress_to_stderr(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)

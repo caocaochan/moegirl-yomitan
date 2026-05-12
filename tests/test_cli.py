@@ -7,7 +7,7 @@ import pytest
 from moegirl_yomitan import cli
 from moegirl_yomitan.config import Settings
 from moegirl_yomitan.models import ManifestPage, SummaryRecord
-from moegirl_yomitan.packaging import build_dictionary_content_fingerprint, save_build_state
+from moegirl_yomitan.packaging import build_dictionary_content_fingerprint, load_build_state, save_build_state
 
 
 def test_build_from_cache_skips_fetch(monkeypatch, capsys) -> None:
@@ -118,6 +118,31 @@ def test_check_build_change_reports_changed_when_fingerprint_differs(tmp_path: P
         "changed=true",
         f"fingerprint={build_dictionary_content_fingerprint(settings)}",
     ]
+
+
+def test_save_build_state_command_writes_structured_state(tmp_path: Path, capsys) -> None:
+    settings = write_single_page_cache(tmp_path)
+    fingerprint = build_dictionary_content_fingerprint(settings)
+
+    result = cli.main(
+        [
+            "save-build-state",
+            "--cache-dir",
+            str(settings.cache_dir),
+            "--output",
+            str(settings.output_zip),
+            "--fingerprint",
+            fingerprint,
+        ]
+    )
+
+    assert result == 0
+    assert capsys.readouterr().out.strip() == f"Saved build state for fingerprint {fingerprint}"
+    state = load_build_state(settings)
+    assert state["content_fingerprint"] == fingerprint
+    assert state["schema_version"] == 2
+    assert state["algorithm_version"]
+    assert list(state["record_fingerprints"]) == ["1"]
 
 
 def write_single_page_cache(tmp_path: Path) -> Settings:

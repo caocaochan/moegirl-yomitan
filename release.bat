@@ -84,5 +84,9 @@ echo Creating GitHub release %BUILD_VERSION%...
 gh release create "%BUILD_VERSION%" "dist\moegirl-yomitan.zip" "dist\moegirl-yomitan-index.json" --title "%BUILD_VERSION%" --notes "Manual Yomitan dictionary build for version %BUILD_VERSION%."
 if errorlevel 1 exit /b 1
 
+echo Saving released build state...
+python -m moegirl_yomitan save-build-state --fingerprint "%FINGERPRINT%"
+if errorlevel 1 exit /b 1
+
 echo Release %BUILD_VERSION% published.
 exit /b 0
