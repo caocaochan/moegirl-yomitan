@@ -372,7 +372,6 @@ def build_term_entry_for_term(record: SummaryRecord, term: str, score: int = 0) 
                         "tag": "div",
                         "lang": STRUCTURED_CONTENT_LANG,
                         "content": [
-                            "来源：萌娘百科（摘要，非全文）。",
                             {"tag": "a", "href": record.article_url, "content": ["查看原文"]},
                         ],
                     },

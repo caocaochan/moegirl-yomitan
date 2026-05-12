@@ -41,6 +41,7 @@ def test_build_term_entry_has_expected_shape() -> None:
     content = entry[5][0]["content"]
     assert content[0]["lang"] == "zh-Hans"
     assert content[1]["lang"] == "zh-Hans"
+    assert content[1]["content"] == [{"tag": "a", "href": record["article_url"], "content": ["查看原文"]}]
     assert entry[6] == 1
 
 
