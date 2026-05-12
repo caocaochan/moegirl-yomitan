@@ -44,6 +44,10 @@ jobs:
           restore-keys: |
             moegirl-yomitan-cache-
 
+      - name: Diagnose sitemap access
+        continue-on-error: true
+        run: curl -I -L --max-time 30 https://mzh.moegirl.org.cn/sitemap/sitemap-index-zhmoegirl.xml
+
       - name: Refresh fetched data
         run: python -m moegirl_yomitan fetch --retry-attempts 8 --request-timeout 240 --backoff-base-seconds 2
 

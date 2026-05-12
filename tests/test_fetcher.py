@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from pathlib import Path
 
@@ -266,6 +267,7 @@ def test_fetch_text_from_candidates_reports_all_failures(monkeypatch) -> None:
         raise requests.HTTPError(f"failed {url}", response=response)
 
     monkeypatch.setattr(fetcher, "fetch_text_with_retry", fake_fetch_text_with_retry)
+    monkeypatch.setattr(fetcher, "fetch_text_with_curl", lambda *args, **kwargs: (_ for _ in ()).throw(requests.HTTPError("curl failed")))
 
     with pytest.raises(requests.HTTPError) as exc_info:
         fetcher.fetch_text_from_candidates(object(), candidates, settings)
@@ -275,6 +277,100 @@ def test_fetch_text_from_candidates_reports_all_failures(monkeypatch) -> None:
     assert candidates[1] in message
     assert "HTTPError status=503" in message
     assert "HTTPError status=504" in message
+
+
+def test_transport_fallback_returns_valid_curl_stdout_after_requests_403(monkeypatch) -> None:
+    settings = Settings()
+    response = requests.Response()
+    response.status_code = 403
+
+    def fail_requests(session, url, settings, validator=None):
+        raise requests.HTTPError("403 Client Error: Forbidden", response=response)
+
+    def fake_run(args, capture_output, encoding, text, check):
+        assert args[0] == "curl"
+        assert "--user-agent" in args
+        assert settings.user_agent in args
+        return subprocess.CompletedProcess(args, 0, stdout="<sitemapindex></sitemapindex>", stderr="")
+
+    monkeypatch.setattr(fetcher, "fetch_text_with_retry", fail_requests)
+    monkeypatch.setattr(fetcher.subprocess, "run", fake_run)
+
+    text = fetcher.fetch_text_with_transport_fallback(
+        object(),
+        "https://mzh.moegirl.org.cn/sitemap/sitemap-index-zhmoegirl.xml",
+        settings,
+        validator=lambda value: value.endswith("</sitemapindex>"),
+    )
+
+    assert text == "<sitemapindex></sitemapindex>"
+
+
+def test_transport_fallback_reports_requests_and_curl_failures(monkeypatch) -> None:
+    settings = Settings()
+    response = requests.Response()
+    response.status_code = 403
+
+    def fail_requests(session, url, settings, validator=None):
+        raise requests.HTTPError("403 Client Error: Forbidden", response=response)
+
+    def fake_run(args, capture_output, encoding, text, check):
+        return subprocess.CompletedProcess(args, 22, stdout="", stderr="curl: (22) HTTP response code said error")
+
+    monkeypatch.setattr(fetcher, "fetch_text_with_retry", fail_requests)
+    monkeypatch.setattr(fetcher.subprocess, "run", fake_run)
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        fetcher.fetch_text_with_transport_fallback(object(), "https://example.invalid/sitemap.xml", settings)
+
+    message = str(exc_info.value)
+    assert "requests=(HTTPError status=403" in message
+    assert "curl=(HTTPError: curl failed while fetching https://example.invalid/sitemap.xml" in message
+    assert "curl: (22) HTTP response code said error" in message
+
+
+def test_fetch_text_with_curl_validates_response(monkeypatch) -> None:
+    settings = Settings()
+
+    def fake_run(args, capture_output, encoding, text, check):
+        return subprocess.CompletedProcess(args, 0, stdout="<sitemapindex>", stderr="")
+
+    monkeypatch.setattr(fetcher.subprocess, "run", fake_run)
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        fetcher.fetch_text_with_curl(
+            "https://example.invalid/sitemap.xml",
+            settings,
+            validator=lambda value: value.endswith("</sitemapindex>"),
+        )
+
+    assert "Incomplete response while fetching https://example.invalid/sitemap.xml via curl" in str(exc_info.value)
+
+
+def test_fetch_sitemap_text_with_fallback_uses_curl_for_namespace_sitemaps(monkeypatch) -> None:
+    settings = Settings()
+    response = requests.Response()
+    response.status_code = 403
+    curl_urls: list[str] = []
+
+    def fail_requests(session, url, settings, validator=None):
+        raise requests.HTTPError("403 Client Error: Forbidden", response=response)
+
+    def fake_run(args, capture_output, encoding, text, check):
+        curl_urls.append(args[-1])
+        return subprocess.CompletedProcess(args, 0, stdout="<urlset></urlset>", stderr="")
+
+    monkeypatch.setattr(fetcher, "fetch_text_with_retry", fail_requests)
+    monkeypatch.setattr(fetcher.subprocess, "run", fake_run)
+
+    text = fetcher.fetch_sitemap_text_with_fallback(
+        object(),
+        "https://mzh.moegirl.org.cn/sitemap/sitemap-zhmoegirl-NS_0-0.xml",
+        settings,
+    )
+
+    assert text == "<urlset></urlset>"
+    assert curl_urls == ["https://mzh.moegirl.org.cn/sitemap/sitemap-zhmoegirl-NS_0-0.xml"]
 
 
 def test_discover_pages_with_limit_stops_after_enough_entries(tmp_path: Path, monkeypatch) -> None:

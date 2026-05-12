@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import subprocess
 import threading
 import time
 from typing import Callable, Iterable
@@ -634,12 +635,77 @@ def fetch_text_with_retry(
     raise RuntimeError(f"Failed to fetch complete text from {url}")
 
 
+def fetch_text_with_curl(
+    url: str,
+    settings: Settings,
+    validator: Callable[[str], bool] | None = None,
+) -> str:
+    connect_timeout, read_timeout = request_timeout_parts(settings)
+    result = subprocess.run(
+        [
+            "curl",
+            "--fail",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            str(connect_timeout),
+            "--max-time",
+            str(read_timeout),
+            "--user-agent",
+            settings.user_agent,
+            "--header",
+            "Accept: application/xml,text/xml,*/*;q=0.8",
+            url,
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or "<no stderr>"
+        raise requests.HTTPError(f"curl failed while fetching {url}: {stderr}")
+
+    text = result.stdout
+    if validator is not None and not validator(text):
+        raise requests.HTTPError(f"Incomplete response while fetching {url} via curl")
+    return text
+
+
+def request_timeout_parts(settings: Settings) -> tuple[float, float]:
+    timeout = settings.request_timeout
+    if isinstance(timeout, tuple):
+        return float(timeout[0]), float(timeout[1])
+    value = float(timeout)
+    return value, value
+
+
+def fetch_text_with_transport_fallback(
+    session: requests.Session,
+    url: str,
+    settings: Settings,
+    validator: Callable[[str], bool] | None = None,
+) -> str:
+    try:
+        return fetch_text_with_retry(session, url, settings, validator=validator)
+    except requests.RequestException as requests_error:
+        try:
+            return fetch_text_with_curl(url, settings, validator=validator)
+        except requests.RequestException as curl_error:
+            raise requests.HTTPError(
+                "Unable to fetch text with requests or curl for "
+                f"{url}. requests=({format_request_error(requests_error)}); "
+                f"curl=({format_request_error(curl_error)})"
+            ) from curl_error
+
+
 def fetch_sitemap_text_with_fallback(session: requests.Session, url: str, settings: Settings) -> str:
     candidates = sitemap_url_candidates(url)
     best_partial: tuple[int, str] | None = None
     for candidate in candidates:
         try:
-            return fetch_text_with_retry(
+            return fetch_text_with_transport_fallback(
                 session,
                 candidate,
                 settings,
@@ -647,7 +713,7 @@ def fetch_sitemap_text_with_fallback(session: requests.Session, url: str, settin
             )
         except requests.RequestException:
             try:
-                partial_text = fetch_text_with_retry(session, candidate, settings, validator=None)
+                partial_text = fetch_text_with_transport_fallback(session, candidate, settings, validator=None)
             except requests.RequestException:
                 continue
             if best_partial is None or len(partial_text) > best_partial[0]:
@@ -667,7 +733,7 @@ def fetch_text_from_candidates(
     errors: list[tuple[str, requests.RequestException]] = []
     for candidate in candidates:
         try:
-            return fetch_text_with_retry(session, candidate, settings, validator=validator)
+            return fetch_text_with_transport_fallback(session, candidate, settings, validator=validator)
         except requests.RequestException as exc:
             errors.append((candidate, exc))
             continue
