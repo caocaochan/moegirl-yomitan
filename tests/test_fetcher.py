@@ -135,6 +135,22 @@ def test_write_record_rewrites_changed_payload(tmp_path: Path, monkeypatch) -> N
     assert stored["summary"] == "新摘要。"
 
 
+def test_limited_record_cache_index_loads_only_referenced_records(tmp_path: Path) -> None:
+    settings = Settings(cache_dir=tmp_path / "cache")
+    record = make_record()
+    write_record(settings, record)
+    settings.records_dir.joinpath("999.json").write_text("{not-json", encoding="utf-8")
+
+    page = make_page()
+    page.pageid = record.pageid
+    page.record_path = "records/1.json"
+
+    index = fetcher.build_record_cache_index_for_pages(settings, [page])
+
+    assert index.count == 1
+    assert record_for_page(page, index) == record
+
+
 def test_fetch_pages_reuses_cached_record_when_manifest_is_incomplete(tmp_path: Path, monkeypatch) -> None:
     settings = Settings(cache_dir=tmp_path / "cache", batch_size=1, concurrency=1)
     initial_record = make_record()
@@ -235,6 +251,67 @@ def test_fetch_extract_payload_uses_post(monkeypatch) -> None:
     assert captured["params"] is None
     assert captured["data"] is not None
     assert captured["data"]["titles"] == "萌娘|舰队Collection"
+
+
+def test_fetch_text_from_candidates_reports_all_failures(monkeypatch) -> None:
+    settings = Settings()
+    candidates = [
+        "https://mzh.moegirl.org.cn/sitemap/sitemap-index-zhmoegirl.xml",
+        "https://zh.moegirl.org.cn/sitemap/sitemap-index-zhmoegirl.xml",
+    ]
+
+    def fake_fetch_text_with_retry(session, url, settings, validator=None):
+        response = requests.Response()
+        response.status_code = 503 if "mzh." in url else 504
+        raise requests.HTTPError(f"failed {url}", response=response)
+
+    monkeypatch.setattr(fetcher, "fetch_text_with_retry", fake_fetch_text_with_retry)
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        fetcher.fetch_text_from_candidates(object(), candidates, settings)
+
+    message = str(exc_info.value)
+    assert candidates[0] in message
+    assert candidates[1] in message
+    assert "HTTPError status=503" in message
+    assert "HTTPError status=504" in message
+
+
+def test_discover_pages_with_limit_stops_after_enough_entries(tmp_path: Path, monkeypatch) -> None:
+    settings = Settings(cache_dir=tmp_path / "cache")
+    sitemap_index_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <sitemap><loc>https://mzh.moegirl.org.cn/sitemap/sitemap-zhmoegirl-NS_0-0.xml</loc></sitemap>
+      <sitemap><loc>https://mzh.moegirl.org.cn/sitemap/sitemap-zhmoegirl-NS_0-1.xml</loc></sitemap>
+    </sitemapindex>
+    """
+    first_sitemap_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <url>
+        <loc>https://mzh.moegirl.org.cn/%E8%90%8C%E5%A8%98</loc>
+        <lastmod>2026-04-28T00:00:00Z</lastmod>
+      </url>
+    </urlset>
+    """
+    fetched_sitemaps: list[str] = []
+
+    monkeypatch.setattr(fetcher, "fetch_text_from_candidates", lambda *args, **kwargs: sitemap_index_xml)
+
+    def fake_fetch_sitemap_text_with_fallback(session, url: str, settings: Settings) -> str:
+        fetched_sitemaps.append(url)
+        return first_sitemap_xml
+
+    monkeypatch.setattr(fetcher, "fetch_sitemap_text_with_fallback", fake_fetch_sitemap_text_with_fallback)
+    monkeypatch.setattr(
+        fetcher,
+        "fetch_sitemaps_in_parallel",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("limited discovery should not fetch in parallel")),
+    )
+
+    pages = fetcher.discover_pages(settings, object(), limit=1)
+
+    assert [page.title_from_url for page in pages] == ["萌娘"]
+    assert fetched_sitemaps == ["https://mzh.moegirl.org.cn/sitemap/sitemap-zhmoegirl-NS_0-0.xml"]
 
 
 def test_fetch_batch_splits_oversized_requests_and_preserves_order(monkeypatch) -> None:
@@ -535,7 +612,7 @@ def test_fetch_pages_does_not_rebuild_record_index_after_fetch(tmp_path: Path, m
 
     monkeypatch.setattr(fetcher, "build_record_cache_index", fake_build_record_cache_index)
 
-    fetch_pages(settings, limit=1)
+    fetch_pages(settings)
 
     assert build_calls == 1
 

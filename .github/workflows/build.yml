@@ -45,7 +45,7 @@ jobs:
             moegirl-yomitan-cache-
 
       - name: Refresh fetched data
-        run: python -m moegirl_yomitan fetch
+        run: python -m moegirl_yomitan fetch --retry-attempts 8 --request-timeout 240 --backoff-base-seconds 2
 
       - name: Detect packaged content changes
         id: change

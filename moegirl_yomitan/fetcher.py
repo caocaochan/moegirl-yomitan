@@ -170,13 +170,18 @@ def discover_pages(settings: Settings, session: requests.Session, limit: int | N
     sitemap_urls = parse_namespace_zero_sitemaps(sitemap_index_xml)
 
     discovered: list[ManifestPage] = []
-    sitemap_texts = fetch_sitemaps_in_parallel(settings, sitemap_urls)
-    for sitemap_url in sitemap_urls:
-        sitemap_xml = sitemap_texts[sitemap_url]
-        discovered.extend(parse_sitemap_entries(sitemap_xml, sitemap_url))
-        if limit is not None and len(discovered) >= limit:
-            discovered = discovered[:limit]
-            break
+    if limit is None:
+        sitemap_texts = fetch_sitemaps_in_parallel(settings, sitemap_urls)
+        for sitemap_url in sitemap_urls:
+            sitemap_xml = sitemap_texts[sitemap_url]
+            discovered.extend(parse_sitemap_entries(sitemap_xml, sitemap_url))
+    else:
+        for sitemap_url in sitemap_urls:
+            sitemap_xml = fetch_sitemap_text_with_fallback(session, sitemap_url, settings)
+            discovered.extend(parse_sitemap_entries(sitemap_xml, sitemap_url))
+            if len(discovered) >= limit:
+                discovered = discovered[:limit]
+                break
 
     previous_pages = {page.source_url: page for page in load_manifest(settings)}
     return merge_manifest_pages(discovered, previous_pages)
@@ -242,6 +247,37 @@ def build_record_cache_index(settings: Settings) -> RecordCacheIndex:
         by_pageid=by_pageid,
         by_canonical_title=by_canonical_title,
         count=count,
+    )
+
+
+def build_record_cache_index_for_pages(settings: Settings, pages: Iterable[ManifestPage]) -> RecordCacheIndex:
+    if not settings.records_dir.exists():
+        return RecordCacheIndex({}, {}, {})
+
+    record_paths: set[Path] = set()
+    for page in pages:
+        if page.record_path:
+            record_paths.add(settings.cache_dir / page.record_path)
+        if page.pageid is not None:
+            record_paths.add(record_path_for_page(settings, page.pageid))
+
+    if not record_paths:
+        return build_record_cache_index(settings)
+
+    records = [record for path in sorted(record_paths) if (record := load_record(path)) is not None]
+    by_source_url: dict[str, SummaryRecord] = {}
+    by_pageid: dict[int, SummaryRecord] = {}
+    by_canonical_title: dict[str, SummaryRecord] = {}
+    for record in records:
+        by_source_url.setdefault(record.source_url, record)
+        by_pageid.setdefault(record.pageid, record)
+        by_canonical_title.setdefault(record.canonical_title, record)
+
+    return RecordCacheIndex(
+        by_source_url=by_source_url,
+        by_pageid=by_pageid,
+        by_canonical_title=by_canonical_title,
+        count=len(records),
     )
 
 
@@ -333,7 +369,10 @@ def fetch_pages(settings: Settings, limit: int | None = None) -> list[ManifestPa
 
     log_status("Loading record cache index...")
     index_started_at = time.monotonic()
-    record_index = build_record_cache_index(settings)
+    if limit is not None:
+        record_index = build_record_cache_index_for_pages(settings, pages)
+    else:
+        record_index = build_record_cache_index(settings)
     log_status(f"Loaded {record_index.count} cached records in {time.monotonic() - index_started_at:.1f}s.")
 
     hydrated_from_records = hydrate_pages_from_record_cache(settings, pages, record_index)
@@ -625,12 +664,38 @@ def fetch_text_from_candidates(
     settings: Settings,
     validator: Callable[[str], bool] | None = None,
 ) -> str:
+    errors: list[tuple[str, requests.RequestException]] = []
     for candidate in candidates:
         try:
             return fetch_text_with_retry(session, candidate, settings, validator=validator)
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            errors.append((candidate, exc))
             continue
-    raise requests.HTTPError(f"Unable to fetch text from any candidate for {candidates[0]}")
+
+    raise requests.HTTPError(
+        build_candidate_failure_message("Unable to fetch text from any candidate", errors, candidates)
+    )
+
+
+def build_candidate_failure_message(
+    prefix: str,
+    errors: list[tuple[str, requests.RequestException]],
+    candidates: list[str],
+) -> str:
+    attempted = errors or [(candidate, requests.HTTPError("not attempted")) for candidate in candidates]
+    details = "; ".join(f"{url} ({format_request_error(error)})" for url, error in attempted)
+    first_candidate = candidates[0] if candidates else "<no candidates>"
+    return f"{prefix} for {first_candidate}. Attempts: {details}"
+
+
+def format_request_error(error: requests.RequestException) -> str:
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    status = f" status={status_code}" if status_code is not None else ""
+    message = str(error).replace("\n", " ").strip()
+    if not message:
+        message = "<no message>"
+    return f"{type(error).__name__}{status}: {message}"
 
 
 def adaptive_state_after_failure(settings: Settings, state: AdaptiveState) -> AdaptiveState:

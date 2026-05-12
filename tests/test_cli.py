@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 
+import pytest
+
 from moegirl_yomitan import cli
 from moegirl_yomitan.config import Settings
 from moegirl_yomitan.models import ManifestPage, SummaryRecord
@@ -36,6 +38,48 @@ def test_build_without_from_cache_fetches_and_packages(monkeypatch, capsys) -> N
     assert result == 0
     assert fetch_calls == [3]
     assert capsys.readouterr().out.strip() == f"Built dictionary archive from 3 discovered pages: {output_path}"
+
+
+def test_fetch_passes_retry_settings_to_settings(monkeypatch, capsys) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_fetch_pages(settings: Settings, limit=None):
+        captured["settings"] = settings
+        captured["limit"] = limit
+        return [object()]
+
+    monkeypatch.setattr(cli, "fetch_pages", fake_fetch_pages)
+
+    result = cli.main(
+        [
+            "fetch",
+            "--limit",
+            "1",
+            "--retry-attempts",
+            "8",
+            "--request-timeout",
+            "240",
+            "--backoff-base-seconds",
+            "2",
+        ]
+    )
+
+    settings = captured["settings"]
+    assert isinstance(settings, Settings)
+    assert result == 0
+    assert captured["limit"] == 1
+    assert settings.retry_attempts == 8
+    assert settings.request_timeout == (30.0, 240.0)
+    assert settings.backoff_base_seconds == 2.0
+    assert capsys.readouterr().out.strip() == f"Fetched manifest with 1 pages into {settings.cache_dir}"
+
+
+def test_request_timeout_rejects_invalid_values() -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["fetch", "--request-timeout", "0"])
+
+    with pytest.raises(SystemExit):
+        cli.main(["fetch", "--request-timeout", "-1"])
 
 
 def test_check_build_change_reports_changed_without_saved_state(tmp_path: Path, capsys) -> None:

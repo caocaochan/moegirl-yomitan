@@ -8,6 +8,20 @@ from .fetcher import fetch_pages
 from .packaging import build_dictionary_content_fingerprint, load_last_build_fingerprint, package_dictionary
 
 
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build a Yomitan dictionary from Moegirlpedia lead summaries.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -36,6 +50,9 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--concurrency", type=int, default=Settings.concurrency)
     parser.add_argument("--sitemap-concurrency", type=int, default=Settings.sitemap_concurrency)
     parser.add_argument("--chunk-size", type=int, default=Settings.chunk_size)
+    parser.add_argument("--retry-attempts", type=positive_int, default=Settings.retry_attempts)
+    parser.add_argument("--request-timeout", type=positive_float, default=Settings.request_timeout[1])
+    parser.add_argument("--backoff-base-seconds", type=positive_float, default=Settings.backoff_base_seconds)
 
 
 def settings_from_args(args: argparse.Namespace) -> Settings:
@@ -47,6 +64,9 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
         concurrency=args.concurrency,
         sitemap_concurrency=args.sitemap_concurrency,
         chunk_size=args.chunk_size,
+        retry_attempts=args.retry_attempts,
+        request_timeout=(30.0, args.request_timeout),
+        backoff_base_seconds=args.backoff_base_seconds,
     )
 
 
