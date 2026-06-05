@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 import json
 from pathlib import Path
 import subprocess
@@ -15,8 +16,9 @@ from typing import Any, Callable, Iterable
 import requests
 
 from .config import Settings
-from .models import ManifestPage, SummaryRecord
+from .models import SUMMARY_RECORD_SCHEMA_VERSION, ListedLink, ManifestPage, SummaryRecord
 from .sitemaps import (
+    canonical_article_url,
     merge_manifest_pages,
     parse_namespace_zero_sitemaps,
     parse_sitemap_entries,
@@ -31,7 +33,7 @@ SLOW_CHECKPOINT_SECONDS = 1.0
 RECORD_CACHE_INDEX_PROGRESS_INTERVAL = 10_000
 SESSION_POOL_BATCH = "batch"
 SESSION_POOL_SITEMAP = "sitemap"
-RECORD_CACHE_INDEX_SCHEMA_VERSION = 1
+RECORD_CACHE_INDEX_SCHEMA_VERSION = 2
 
 _THREAD_LOCAL = threading.local()
 _ACTIVE_SESSION_REGISTRIES: dict[str, list["SessionRegistry"]] = {
@@ -62,6 +64,7 @@ class AdaptiveState:
 
 @dataclass(frozen=True)
 class CachedRecord:
+    record_schema_version: int
     pageid: int
     canonical_title: str
     article_url: str
@@ -74,6 +77,7 @@ class CachedRecord:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CachedRecord" | None:
         try:
+            record_schema_version = data["record_schema_version"]
             pageid = data["pageid"]
             canonical_title = data["canonical_title"]
             article_url = data["article_url"]
@@ -85,7 +89,7 @@ class CachedRecord:
         except KeyError:
             return None
 
-        if not isinstance(pageid, int):
+        if not isinstance(record_schema_version, int) or not isinstance(pageid, int):
             return None
         string_values = (canonical_title, article_url, source_url, lastmod, record_path)
         if not all(isinstance(value, str) for value in string_values):
@@ -93,6 +97,7 @@ class CachedRecord:
         if not isinstance(file_size, int) or not isinstance(file_mtime_ns, int):
             return None
         return cls(
+            record_schema_version=record_schema_version,
             pageid=pageid,
             canonical_title=canonical_title,
             article_url=article_url,
@@ -105,6 +110,7 @@ class CachedRecord:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "record_schema_version": self.record_schema_version,
             "pageid": self.pageid,
             "canonical_title": self.canonical_title,
             "article_url": self.article_url,
@@ -164,6 +170,70 @@ class SessionRegistry:
 
 def log_status(message: str) -> None:
     print(message, flush=True)
+
+
+class FirstListItemTitleParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.titles: list[str] = []
+        self._ul_depth = 0
+        self._done = False
+        self._in_li = False
+        self._li_has_title = False
+        self._capture_bold = False
+        self._bold_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self._done:
+            return
+        if tag == "ul":
+            self._ul_depth += 1
+            return
+        if self._ul_depth != 1:
+            return
+        if tag == "li":
+            self._in_li = True
+            self._li_has_title = False
+            return
+        if tag == "b" and self._in_li and not self._li_has_title:
+            self._capture_bold = True
+            self._bold_parts = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._done:
+            return
+        if tag == "b" and self._capture_bold:
+            title = normalize_whitespace("".join(self._bold_parts))
+            if title:
+                self.titles.append(title)
+                self._li_has_title = True
+            self._capture_bold = False
+            self._bold_parts = []
+            return
+        if tag == "li" and self._ul_depth == 1:
+            self._in_li = False
+            self._li_has_title = False
+            self._capture_bold = False
+            self._bold_parts = []
+            return
+        if tag == "ul" and self._ul_depth:
+            self._ul_depth -= 1
+            if self._ul_depth == 0:
+                self._done = True
+
+    def handle_data(self, data: str) -> None:
+        if self._capture_bold:
+            self._bold_parts.append(data)
+
+
+def extract_listed_item_titles(extract_html: str) -> list[str]:
+    parser = FirstListItemTitleParser()
+    parser.feed(extract_html)
+    return parser.titles
+
+
+def summary_may_list_links(summary: str) -> bool:
+    return summary.rstrip().endswith(("可以指：", "可以指:"))
 
 
 def sitemap_progress_name(url: str) -> str:
@@ -342,6 +412,7 @@ def record_relative_path(settings: Settings, record_path: Path) -> str:
 def cached_record_from_record(settings: Settings, record: SummaryRecord, record_path: Path) -> CachedRecord:
     record_stat = record_path.stat()
     return CachedRecord(
+        record_schema_version=record.schema_version,
         pageid=record.pageid,
         canonical_title=record.canonical_title,
         article_url=record.article_url,
@@ -597,6 +668,8 @@ def hydrate_pages_from_record_cache(
 def page_needs_fetch(page: ManifestPage, record: CachedRecord | None) -> bool:
     if record is None:
         return True
+    if record.record_schema_version != SUMMARY_RECORD_SCHEMA_VERSION:
+        return True
     if record.lastmod != page.lastmod:
         return True
     if page.canonical_title and record.canonical_title != page.canonical_title:
@@ -829,6 +902,9 @@ def fetch_batch_with_session(
         pageid = int(payload_page["pageid"])
         title = payload_page["title"]
         article_url = requested_page.source_url
+        listed_links = []
+        if summary_may_list_links(summary):
+            listed_links = fetch_listed_links(session, settings, title)
         records.append(
             SummaryRecord(
                 pageid=pageid,
@@ -838,6 +914,7 @@ def fetch_batch_with_session(
                 lastmod=requested_page.lastmod,
                 summary=summary,
                 retrieved_at=utc_now_iso(),
+                listed_links=listed_links,
             )
         )
     return records
@@ -895,6 +972,75 @@ def fetch_extract_payload(session: requests.Session, settings: Settings, titles:
     if last_error is not None:
         raise last_error
     raise requests.HTTPError(f"Unable to fetch extracts from any candidate for {settings.extracts_api_url}")
+
+
+def fetch_listed_links(session: requests.Session, settings: Settings, title: str) -> list[ListedLink]:
+    extract_html = ""
+    linked_titles: set[str] = set()
+    continuation: dict[str, Any] | None = None
+
+    while True:
+        payload = fetch_listed_links_payload(session, settings, title, continuation=continuation)
+        query = payload.get("query", {})
+        pages = [value for value in query.get("pages", {}).values() if "missing" not in value]
+        if pages:
+            page = pages[0]
+            if not extract_html:
+                extract_html = page.get("extract", "")
+            for link in page.get("links", []):
+                if link.get("ns") != 0:
+                    continue
+                linked_title = link.get("title")
+                if isinstance(linked_title, str) and linked_title:
+                    linked_titles.add(linked_title)
+
+        raw_continuation = payload.get("continue")
+        if not isinstance(raw_continuation, dict) or "plcontinue" not in raw_continuation:
+            break
+        continuation = raw_continuation
+
+    if not extract_html or not linked_titles:
+        return []
+
+    links: list[ListedLink] = []
+    seen_titles: set[str] = set()
+    for listed_title in extract_listed_item_titles(extract_html):
+        if listed_title in seen_titles or listed_title not in linked_titles:
+            continue
+        seen_titles.add(listed_title)
+        links.append(ListedLink(title=listed_title, url=canonical_article_url(listed_title)))
+    return links
+
+
+def fetch_listed_links_payload(
+    session: requests.Session,
+    settings: Settings,
+    title: str,
+    continuation: dict[str, Any] | None = None,
+) -> dict:
+    payload: dict[str, Any] = {
+        "action": "query",
+        "prop": "extracts|links",
+        "redirects": "1",
+        "format": "json",
+        "titles": title,
+        "plnamespace": "0",
+        "pllimit": "max",
+    }
+    if continuation:
+        payload.update(continuation)
+
+    last_error: requests.RequestException | None = None
+    for url in host_fallback_candidates(settings.extracts_api_url):
+        try:
+            response = request_with_retry(session, url, settings, method="POST", data=payload)
+            return response.json()
+        except requests.RequestException as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise last_error
+    raise requests.HTTPError(f"Unable to fetch listed links from any candidate for {settings.extracts_api_url}")
 
 
 def fetch_text_with_retry(

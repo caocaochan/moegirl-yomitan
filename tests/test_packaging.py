@@ -8,7 +8,7 @@ import requests
 
 from moegirl_yomitan.config import Settings
 from moegirl_yomitan.fetcher import AdaptiveState, adaptive_state_after_failure, adaptive_state_after_success, fetch_pages
-from moegirl_yomitan.models import ManifestPage, SummaryRecord
+from moegirl_yomitan.models import ListedLink, ManifestPage, SummaryRecord
 from moegirl_yomitan.packaging import (
     alias_term_for_title,
     build_dictionary_content_fingerprint,
@@ -43,6 +43,42 @@ def test_build_term_entry_has_expected_shape() -> None:
     assert content[1]["lang"] == "zh-Hans"
     assert content[1]["content"] == [{"tag": "a", "href": record["article_url"], "content": ["查看原文"]}]
     assert entry[6] == 1
+
+
+def test_build_term_entry_includes_listed_links_before_original_link() -> None:
+    record = SummaryRecord(
+        pageid=246707,
+        canonical_title="日向花火",
+        article_url="https://mzh.moegirl.org.cn/日向花火",
+        source_url="https://mzh.moegirl.org.cn/日向花火",
+        lastmod="2026-06-05T00:00:00Z",
+        summary="日向花火可以指：",
+        retrieved_at=datetime.now(timezone.utc).isoformat(),
+        listed_links=[
+            ListedLink(title="日向花火(火影忍者)", url="https://mzh.moegirl.org.cn/日向花火(火影忍者)"),
+            ListedLink(title="日向花火(Tropical KISS)", url="https://mzh.moegirl.org.cn/日向花火(Tropical KISS)"),
+        ],
+    )
+
+    entry = build_term_entry(record)
+    content = entry[5][0]["content"]
+
+    assert content[0] == {"tag": "div", "lang": "zh-Hans", "content": ["日向花火可以指："]}
+    assert content[1]["content"] == [
+        {
+            "tag": "a",
+            "href": "https://mzh.moegirl.org.cn/日向花火(火影忍者)",
+            "content": ["日向花火(火影忍者)"],
+        }
+    ]
+    assert content[2]["content"] == [
+        {
+            "tag": "a",
+            "href": "https://mzh.moegirl.org.cn/日向花火(Tropical KISS)",
+            "content": ["日向花火(Tropical KISS)"],
+        }
+    ]
+    assert content[3]["content"] == [{"tag": "a", "href": record.article_url, "content": ["查看原文"]}]
 
 
 def test_build_term_entries_without_fullwidth_parentheses_returns_canonical_only() -> None:

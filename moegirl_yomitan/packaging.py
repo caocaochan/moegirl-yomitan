@@ -25,7 +25,7 @@ READING_SPACE_AFTER_OPENING_PATTERN = re.compile(r"([(\[<{（【《「『])\s+")
 READING_PUNCTUATION_WITH_TRAILING_SPACE_PATTERN = re.compile(r"([,.:;!?:：；，。！？、])(?=\S)")
 STRUCTURED_CONTENT_LANG = "zh-Hans"
 BUILD_STATE_SCHEMA_VERSION = 2
-FINGERPRINT_ALGORITHM_VERSION = "packaged-content-v3"
+FINGERPRINT_ALGORITHM_VERSION = "packaged-content-v4"
 _PINYIN_DATA_READY = False
 ProgressReporter = Callable[[str], None]
 
@@ -374,21 +374,36 @@ def build_term_entry_for_term(record: SummaryRecord, term: str, score: int = 0) 
         [
             {
                 "type": "structured-content",
-                "content": [
-                    {"tag": "div", "lang": STRUCTURED_CONTENT_LANG, "content": [record.summary]},
-                    {
-                        "tag": "div",
-                        "lang": STRUCTURED_CONTENT_LANG,
-                        "content": [
-                            {"tag": "a", "href": record.article_url, "content": ["查看原文"]},
-                        ],
-                    },
-                ],
+                "content": build_structured_content(record),
             }
         ],
         record.pageid,
         "",
     ]
+
+
+def build_structured_content(record: SummaryRecord) -> list[dict]:
+    content = [{"tag": "div", "lang": STRUCTURED_CONTENT_LANG, "content": [record.summary]}]
+    for link in getattr(record, "listed_links", []):
+        content.append(
+            {
+                "tag": "div",
+                "lang": STRUCTURED_CONTENT_LANG,
+                "content": [
+                    {"tag": "a", "href": link.url, "content": [link.title]},
+                ],
+            }
+        )
+    content.append(
+        {
+            "tag": "div",
+            "lang": STRUCTURED_CONTENT_LANG,
+            "content": [
+                {"tag": "a", "href": record.article_url, "content": ["查看原文"]},
+            ],
+        }
+    )
+    return content
 
 
 def alias_term_for_title(title: str) -> str | None:

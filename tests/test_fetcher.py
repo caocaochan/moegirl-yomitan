@@ -21,7 +21,7 @@ from moegirl_yomitan.fetcher import (
     save_manifest,
     write_record,
 )
-from moegirl_yomitan.models import ManifestPage, SummaryRecord
+from moegirl_yomitan.models import ListedLink, ManifestPage, SummaryRecord
 from moegirl_yomitan.packaging import package_dictionary
 
 
@@ -136,6 +136,36 @@ def test_write_record_rewrites_changed_payload(tmp_path: Path, monkeypatch) -> N
     assert atomic_calls == [record_path_for_page(settings, updated.pageid)]
     stored = json.loads(record_path_for_page(settings, updated.pageid).read_text(encoding="utf-8"))
     assert stored["summary"] == "新摘要。"
+
+
+def test_old_record_json_loads_without_listed_links_and_is_marked_pending(tmp_path: Path) -> None:
+    settings = Settings(cache_dir=tmp_path / "cache")
+    record_path = record_path_for_page(settings, 1)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(
+        json.dumps(
+            {
+                "pageid": 1,
+                "canonical_title": "萌娘",
+                "article_url": "https://mzh.moegirl.org.cn/%E8%90%8C%E5%A8%98",
+                "source_url": "https://mzh.moegirl.org.cn/%E8%90%8C%E5%A8%98",
+                "lastmod": "2026-04-28T00:00:00Z",
+                "summary": "这是摘要。",
+                "retrieved_at": "2026-04-28T12:00:00+00:00",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    record = fetcher.load_record(record_path)
+    index = build_record_cache_index(settings)
+    cached = index.by_pageid[1]
+
+    assert record is not None
+    assert record.schema_version == 1
+    assert record.listed_links == []
+    assert page_needs_fetch(make_page(), cached) is True
 
 
 def test_limited_record_cache_index_loads_only_referenced_records(tmp_path: Path) -> None:
@@ -438,6 +468,99 @@ def test_fetch_extract_payload_uses_post(monkeypatch) -> None:
     assert captured["params"] is None
     assert captured["data"] is not None
     assert captured["data"]["titles"] == "萌娘|舰队Collection"
+
+
+def test_fetch_batch_populates_listed_links_for_disambiguation_summary(monkeypatch) -> None:
+    settings = Settings()
+    page = make_page_with_title("日向花火")
+    listed_links = [
+        ListedLink(title="日向花火(火影忍者)", url="https://mzh.moegirl.org.cn/日向花火(火影忍者)"),
+    ]
+    requested_titles: list[str] = []
+
+    def fake_fetch_extract_payload(session, settings, titles: list[str]) -> dict:
+        return {
+            "query": {
+                "pages": {
+                    "246707": {
+                        "pageid": 246707,
+                        "title": titles[0],
+                        "extract": "日向花火可以指：",
+                    }
+                }
+            }
+        }
+
+    def fake_fetch_listed_links(session, settings, title: str) -> list[ListedLink]:
+        requested_titles.append(title)
+        return listed_links
+
+    monkeypatch.setattr(fetcher, "fetch_extract_payload", fake_fetch_extract_payload)
+    monkeypatch.setattr(fetcher, "fetch_listed_links", fake_fetch_listed_links)
+
+    records = fetcher.fetch_batch(settings, [page])
+
+    assert records[0] is not None
+    assert records[0].listed_links == listed_links
+    assert requested_titles == ["日向花火"]
+
+
+def test_fetch_listed_links_filters_broad_page_links_and_preserves_list_order(monkeypatch) -> None:
+    settings = Settings()
+    calls: list[dict | None] = []
+
+    def fake_fetch_listed_links_payload(session, settings, title: str, continuation=None) -> dict:
+        calls.append(continuation)
+        if continuation is None:
+            return {
+                "query": {
+                    "pages": {
+                        "246707": {
+                            "pageid": 246707,
+                            "title": title,
+                            "extract": (
+                                "<p><b>日向花火</b>可以指：</p>"
+                                "<h2>日向花火</h2>"
+                                "<ul>"
+                                "<li><b>日向花火(火影忍者)</b>————岸本齐史创作的漫画《火影忍者》的登场角色。</li>"
+                                "<li><b>日向花火(Tropical KISS)</b>————Twinkle制作的游戏《Tropical KISS》的登场角色。</li>"
+                                "</ul>"
+                            ),
+                            "links": [
+                                {"ns": 0, "title": "Tropical KISS"},
+                                {"ns": 0, "title": "岸本齐史"},
+                                {"ns": 0, "title": "日向花火(Tropical KISS)"},
+                                {"ns": 0, "title": "火影忍者"},
+                            ],
+                        }
+                    }
+                },
+                "continue": {"plcontinue": "246707|0|日向花火(火影忍者)", "continue": "||"},
+            }
+        return {
+            "query": {
+                "pages": {
+                    "246707": {
+                        "pageid": 246707,
+                        "title": title,
+                        "links": [
+                            {"ns": 0, "title": "日向花火(火影忍者)"},
+                            {"ns": 4, "title": "萌娘百科:帮助"},
+                        ],
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr(fetcher, "fetch_listed_links_payload", fake_fetch_listed_links_payload)
+
+    links = fetcher.fetch_listed_links(object(), settings, "日向花火")
+
+    assert calls == [None, {"plcontinue": "246707|0|日向花火(火影忍者)", "continue": "||"}]
+    assert links == [
+        ListedLink(title="日向花火(火影忍者)", url="https://mzh.moegirl.org.cn/日向花火(火影忍者)"),
+        ListedLink(title="日向花火(Tropical KISS)", url="https://mzh.moegirl.org.cn/日向花火(Tropical KISS)"),
+    ]
 
 
 def test_fetch_text_from_candidates_reports_all_failures(monkeypatch) -> None:
