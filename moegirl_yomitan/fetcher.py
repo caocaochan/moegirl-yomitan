@@ -28,6 +28,7 @@ from .text import normalize_whitespace, trim_summary
 CHECKPOINT_INTERVAL_SECONDS = 30.0
 CHECKPOINT_BATCH_INTERVAL = 100
 SLOW_CHECKPOINT_SECONDS = 1.0
+RECORD_CACHE_INDEX_PROGRESS_INTERVAL = 10_000
 SESSION_POOL_BATCH = "batch"
 SESSION_POOL_SITEMAP = "sitemap"
 RECORD_CACHE_INDEX_SCHEMA_VERSION = 1
@@ -165,6 +166,44 @@ def log_status(message: str) -> None:
     print(message, flush=True)
 
 
+def sitemap_progress_name(url: str) -> str:
+    return url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1] or url
+
+
+def log_sitemap_download_progress(
+    done: int,
+    total: int,
+    workers: int,
+    started_at: float,
+    url: str,
+) -> None:
+    elapsed = time.monotonic() - started_at
+    log_status(
+        "Sitemap download progress: "
+        f"{done}/{total} files, "
+        f"workers={workers}, "
+        f"elapsed={elapsed:.1f}s, "
+        f"last={sitemap_progress_name(url)}"
+    )
+
+
+def log_record_cache_index_progress(
+    checked: int,
+    total: int,
+    usable: int,
+    reused: int,
+    started_at: float,
+) -> None:
+    elapsed = time.monotonic() - started_at
+    log_status(
+        "Record cache index progress: "
+        f"checked={checked}/{total}, "
+        f"usable={usable}, "
+        f"reused_index_entries={reused}, "
+        f"elapsed={elapsed:.1f}s"
+    )
+
+
 def get_thread_session(settings: Settings, pool_name: str) -> requests.Session:
     sessions = getattr(_THREAD_LOCAL, "sessions", None)
     if sessions is None:
@@ -220,6 +259,7 @@ def session_registry_scope(pool_name: str) -> Iterable[SessionRegistry]:
 
 
 def discover_pages(settings: Settings, session: requests.Session, limit: int | None = None) -> list[ManifestPage]:
+    log_status("Downloading sitemap index...")
     sitemap_index_xml = fetch_text_from_candidates(
         session,
         sitemap_url_candidates(settings.sitemap_index_url),
@@ -227,21 +267,33 @@ def discover_pages(settings: Settings, session: requests.Session, limit: int | N
         validator=lambda text: xml_has_closing_root(text, "sitemapindex"),
     )
     sitemap_urls = parse_namespace_zero_sitemaps(sitemap_index_xml)
+    log_status(f"Found {len(sitemap_urls)} namespace-zero sitemap files.")
 
     discovered: list[ManifestPage] = []
     if limit is None:
         sitemap_texts = fetch_sitemaps_in_parallel(settings, sitemap_urls)
+        log_status("Parsing sitemap page entries...")
         for sitemap_url in sitemap_urls:
             sitemap_xml = sitemap_texts[sitemap_url]
             discovered.extend(parse_sitemap_entries(sitemap_xml, sitemap_url))
     else:
-        for sitemap_url in sitemap_urls:
+        started_at = time.monotonic()
+        total = len(sitemap_urls)
+        for sitemap_index, sitemap_url in enumerate(sitemap_urls, start=1):
+            log_status(
+                "Downloading sitemap file "
+                f"{sitemap_index}/{total} for limited fetch: {sitemap_progress_name(sitemap_url)}"
+            )
             sitemap_xml = fetch_sitemap_text_with_fallback(session, sitemap_url, settings)
+            log_sitemap_download_progress(sitemap_index, total, 1, started_at, sitemap_url)
             discovered.extend(parse_sitemap_entries(sitemap_xml, sitemap_url))
+            log_status(f"Discovered {len(discovered)} pages so far (limit={limit}).")
             if len(discovered) >= limit:
                 discovered = discovered[:limit]
+                log_status(f"Reached discovery limit of {limit} pages after {sitemap_index}/{total} sitemap files.")
                 break
 
+    log_status("Merging discovered pages with existing manifest...")
     previous_pages = {page.source_url: page for page in load_manifest(settings)}
     return merge_manifest_pages(discovered, previous_pages)
 
@@ -402,12 +454,18 @@ def add_record_to_cache_index(settings: Settings, record_index: RecordCacheIndex
 
 def build_record_cache_index(settings: Settings) -> RecordCacheIndex:
     if not settings.records_dir.exists():
+        log_status("Record cache directory does not exist; starting with an empty index.")
         return RecordCacheIndex({}, {}, {})
 
     persisted_records = load_persisted_record_cache_entries(settings)
+    record_paths = sorted(settings.records_dir.glob("*.json"))
+    total = len(record_paths)
+    log_status(f"Scanning {total} record cache files for index reuse...")
+    started_at = time.monotonic()
     records: list[CachedRecord] = []
+    reused_records = 0
 
-    for record_path in sorted(settings.records_dir.glob("*.json")):
+    for checked, record_path in enumerate(record_paths, start=1):
         try:
             record_stat = record_path.stat()
         except OSError:
@@ -416,20 +474,32 @@ def build_record_cache_index(settings: Settings) -> RecordCacheIndex:
         cached = persisted_records.get(relative_record_path)
         if cached is not None and cached_record_matches_path(cached, relative_record_path, record_stat):
             records.append(cached)
+            reused_records += 1
+            if checked % RECORD_CACHE_INDEX_PROGRESS_INTERVAL == 0:
+                log_record_cache_index_progress(checked, total, len(records), reused_records, started_at)
             continue
 
         record = load_record(record_path)
         if record is None:
+            if checked % RECORD_CACHE_INDEX_PROGRESS_INTERVAL == 0:
+                log_record_cache_index_progress(checked, total, len(records), reused_records, started_at)
             continue
         records.append(cached_record_from_record(settings, record, record_path))
+        if checked % RECORD_CACHE_INDEX_PROGRESS_INTERVAL == 0:
+            log_record_cache_index_progress(checked, total, len(records), reused_records, started_at)
+
+    if total and total % RECORD_CACHE_INDEX_PROGRESS_INTERVAL != 0:
+        log_record_cache_index_progress(total, total, len(records), reused_records, started_at)
 
     index = make_record_cache_index(records)
+    log_status(f"Saving record cache index with {index.count} cached records...")
     save_record_cache_index(settings, index)
     return index
 
 
 def build_record_cache_index_for_pages(settings: Settings, pages: Iterable[ManifestPage]) -> RecordCacheIndex:
     if not settings.records_dir.exists():
+        log_status("Record cache directory does not exist; starting with an empty index.")
         return RecordCacheIndex({}, {}, {})
 
     record_paths: set[Path] = set()
@@ -443,8 +513,13 @@ def build_record_cache_index_for_pages(settings: Settings, pages: Iterable[Manif
         return build_record_cache_index(settings)
 
     persisted_records = load_persisted_record_cache_entries(settings)
+    sorted_record_paths = sorted(record_paths)
+    total = len(sorted_record_paths)
+    log_status(f"Scanning {total} page-specific record cache files for index reuse...")
+    started_at = time.monotonic()
     records: list[CachedRecord] = []
-    for path in sorted(record_paths):
+    reused_records = 0
+    for checked, path in enumerate(sorted_record_paths, start=1):
         try:
             record_stat = path.stat()
         except OSError:
@@ -453,11 +528,19 @@ def build_record_cache_index_for_pages(settings: Settings, pages: Iterable[Manif
         cached = persisted_records.get(relative_record_path)
         if cached is not None and cached_record_matches_path(cached, relative_record_path, record_stat):
             records.append(cached)
+            reused_records += 1
+            if checked % RECORD_CACHE_INDEX_PROGRESS_INTERVAL == 0:
+                log_record_cache_index_progress(checked, total, len(records), reused_records, started_at)
             continue
 
         record = load_record(path)
         if record is not None:
             records.append(cached_record_from_record(settings, record, path))
+        if checked % RECORD_CACHE_INDEX_PROGRESS_INTERVAL == 0:
+            log_record_cache_index_progress(checked, total, len(records), reused_records, started_at)
+
+    if total and total % RECORD_CACHE_INDEX_PROGRESS_INTERVAL != 0:
+        log_record_cache_index_progress(total, total, len(records), reused_records, started_at)
 
     return make_record_cache_index(records)
 
@@ -574,7 +657,14 @@ def fetch_pages(settings: Settings, limit: int | None = None) -> list[ManifestPa
         last_checkpoint_at=fetch_started_at,
     )
 
-    log_status(f"Fetching {len(pending)} pending pages across {len(batches)} batches.")
+    log_status(
+        "Fetching pending pages: "
+        f"{len(pending)} pages, "
+        f"{len(batches)} batches, "
+        f"concurrency={settings.concurrency}, "
+        f"batch_retries={settings.batch_retry_attempts}, "
+        f"checkpoint_every={CHECKPOINT_BATCH_INTERVAL} batches or {CHECKPOINT_INTERVAL_SECONDS:.0f}s."
+    )
     save_manifest_checkpoint(settings, pages, progress_state, force=True)
     run_adaptive_fetch_loop(settings, pages, batches, progress_state, record_index)
     if limit is None:
@@ -758,17 +848,24 @@ def fetch_sitemaps_in_parallel(settings: Settings, sitemap_urls: list[str]) -> d
         return {}
 
     workers = max(1, min(settings.sitemap_concurrency, len(sitemap_urls)))
+    started_at = time.monotonic()
+    log_status(f"Downloading {len(sitemap_urls)} sitemap files with {workers} workers...")
     if workers == 1:
         with session_registry_scope(SESSION_POOL_SITEMAP):
-            return {url: fetch_sitemap_worker(settings, url) for url in sitemap_urls}
+            results = {}
+            for done, url in enumerate(sitemap_urls, start=1):
+                results[url] = fetch_sitemap_worker(settings, url)
+                log_sitemap_download_progress(done, len(sitemap_urls), workers, started_at, url)
+            return results
 
     results: dict[str, str] = {}
     with session_registry_scope(SESSION_POOL_SITEMAP):
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(fetch_sitemap_worker, settings, url): url for url in sitemap_urls}
-            for future in as_completed(futures):
+            for done, future in enumerate(as_completed(futures), start=1):
                 url = futures[future]
                 results[url] = future.result()
+                log_sitemap_download_progress(done, len(sitemap_urls), workers, started_at, url)
     return results
 
 

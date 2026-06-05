@@ -14,7 +14,7 @@ def test_build_from_cache_skips_fetch(monkeypatch, capsys) -> None:
     output_path = Path("dist") / "cached.zip"
 
     monkeypatch.setattr(cli, "fetch_pages", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not fetch")))
-    monkeypatch.setattr(cli, "package_dictionary", lambda settings: output_path)
+    monkeypatch.setattr(cli, "package_dictionary", lambda settings, progress=None: output_path)
 
     result = cli.main(["build", "--from-cache"])
 
@@ -31,7 +31,7 @@ def test_build_without_from_cache_fetches_and_packages(monkeypatch, capsys) -> N
         return [object(), object(), object()]
 
     monkeypatch.setattr(cli, "fetch_pages", fake_fetch_pages)
-    monkeypatch.setattr(cli, "package_dictionary", lambda settings: output_path)
+    monkeypatch.setattr(cli, "package_dictionary", lambda settings, progress=None: output_path)
 
     result = cli.main(["build", "--limit", "3"])
 

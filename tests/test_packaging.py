@@ -267,6 +267,29 @@ def test_package_dictionary_writes_zip_and_standalone_index_with_shared_revision
     assert index_data["revision"] == "2026.04.29.2"
 
 
+def test_package_dictionary_reports_progress_and_preserves_archive(tmp_path: Path, monkeypatch) -> None:
+    settings = write_single_page_cache(tmp_path)
+    monkeypatch.setattr("moegirl_yomitan.packaging.resolve_build_version", lambda: "2026.04.29.2")
+    messages: list[str] = []
+
+    output_path = package_dictionary(settings, progress=messages.append)
+
+    assert output_path == settings.output_zip
+    assert output_path.exists()
+    assert settings.output_index.exists()
+    assert messages == [
+        "Loaded 1 packaged records.",
+        f"Writing standalone index to {settings.output_index}.",
+        "Writing term_bank_1.json (1 records, 1/1).",
+        f"Wrote dictionary archive to {settings.output_zip}.",
+    ]
+
+    with ZipFile(output_path) as archive:
+        names = sorted(archive.namelist())
+
+    assert names == ["index.json", "term_bank_1.json"]
+
+
 def test_dictionary_content_fingerprint_ignores_retrieved_at(tmp_path: Path) -> None:
     first = write_single_page_cache(
         tmp_path / "first",

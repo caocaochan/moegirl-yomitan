@@ -89,23 +89,31 @@ class DictionaryFingerprintResult:
     recomputed_records: int
 
 
-def package_dictionary(settings: Settings) -> Path:
+def package_dictionary(settings: Settings, progress: ProgressReporter | None = None) -> Path:
     ordered_records = load_packaged_records(settings)
+    report_progress(progress, f"Loaded {len(ordered_records)} packaged records.")
     build_version = resolve_build_version()
     index_data = build_index(settings, revision=build_version)
     serialized_index = json.dumps(index_data, ensure_ascii=False, indent=2)
 
     settings.output_zip.parent.mkdir(parents=True, exist_ok=True)
     settings.output_index.parent.mkdir(parents=True, exist_ok=True)
+    report_progress(progress, f"Writing standalone index to {settings.output_index}.")
     settings.output_index.write_text(serialized_index, encoding="utf-8")
+    record_chunks = chunked(ordered_records, settings.chunk_size)
     with ZipFile(settings.output_zip, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
         archive.writestr("index.json", serialized_index)
-        for file_number, chunk in enumerate(chunked(ordered_records, settings.chunk_size), start=1):
+        for file_number, chunk in enumerate(record_chunks, start=1):
+            report_progress(
+                progress,
+                f"Writing term_bank_{file_number}.json ({len(chunk)} records, {file_number}/{len(record_chunks)}).",
+            )
             entries = [entry for record in chunk for entry in build_term_entries(record)]
             archive.writestr(
                 f"term_bank_{file_number}.json",
                 json.dumps(entries, ensure_ascii=False, separators=(",", ":")),
             )
+    report_progress(progress, f"Wrote dictionary archive to {settings.output_zip}.")
     return settings.output_zip
 
 

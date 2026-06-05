@@ -22,17 +22,17 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Fetching release tags...
+echo Fetching release tags from GitHub...
 git fetch --force --tags
 if errorlevel 1 exit /b 1
 
-echo Refreshing Moegirl cache...
+echo Refreshing Moegirl cache: discovering sitemaps, comparing cache, and fetching changed summaries...
 python -m moegirl_yomitan fetch --retry-attempts 8 --request-timeout 240 --backoff-base-seconds 2
 if errorlevel 1 exit /b 1
 
 set "CHANGE_FILE=%TEMP%\moegirl-yomitan-build-change-%RANDOM%-%RANDOM%.txt"
 
-echo Checking packaged content changes...
+echo Checking packaged content changes by scanning cached fingerprints...
 python -m moegirl_yomitan check-build-change > "%CHANGE_FILE%"
 set "CHECK_EXIT=%ERRORLEVEL%"
 type "%CHANGE_FILE%"
@@ -65,7 +65,7 @@ if not defined BUILD_VERSION (
     exit /b 1
 )
 
-echo Building version %BUILD_VERSION%...
+echo Building version %BUILD_VERSION% from cache and writing zip/index assets...
 set "MOEGIRL_YOMITAN_BUILD_VERSION=%BUILD_VERSION%"
 python -m moegirl_yomitan build --from-cache --output dist/moegirl-yomitan.zip
 if errorlevel 1 exit /b 1
@@ -80,7 +80,7 @@ if not exist "dist\moegirl-yomitan-index.json" (
     exit /b 1
 )
 
-echo Creating GitHub release %BUILD_VERSION%...
+echo Creating GitHub release %BUILD_VERSION% and uploading release assets...
 gh release create "%BUILD_VERSION%" "dist\moegirl-yomitan.zip" "dist\moegirl-yomitan-index.json" --title "%BUILD_VERSION%" --notes "Manual Yomitan dictionary build for version %BUILD_VERSION%."
 if errorlevel 1 exit /b 1
 

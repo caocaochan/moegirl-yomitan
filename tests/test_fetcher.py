@@ -156,6 +156,45 @@ def test_limited_record_cache_index_loads_only_referenced_records(tmp_path: Path
     assert cached.source_url == record.source_url
 
 
+def test_limited_record_cache_index_reports_scan_progress(tmp_path: Path, monkeypatch) -> None:
+    settings = Settings(cache_dir=tmp_path / "cache")
+    record = make_record()
+    write_record(settings, record)
+    messages: list[str] = []
+
+    page = make_page()
+    page.pageid = record.pageid
+    page.record_path = "records/1.json"
+
+    monkeypatch.setattr(fetcher, "RECORD_CACHE_INDEX_PROGRESS_INTERVAL", 1)
+    monkeypatch.setattr(fetcher, "log_status", messages.append)
+
+    index = fetcher.build_record_cache_index_for_pages(settings, [page])
+
+    assert index.count == 1
+    assert any(message == "Scanning 1 page-specific record cache files for index reuse..." for message in messages)
+    assert any(message.startswith("Record cache index progress: checked=1/1, usable=1") for message in messages)
+
+
+def test_record_cache_index_reports_scan_and_save_progress(tmp_path: Path, monkeypatch) -> None:
+    settings = Settings(cache_dir=tmp_path / "cache")
+    write_record(settings, make_record())
+    second_page = make_page_with_title("乙")
+    write_record(settings, make_record_for_page(second_page, pageid=2))
+    messages: list[str] = []
+
+    monkeypatch.setattr(fetcher, "RECORD_CACHE_INDEX_PROGRESS_INTERVAL", 1)
+    monkeypatch.setattr(fetcher, "log_status", messages.append)
+
+    index = build_record_cache_index(settings)
+
+    assert index.count == 2
+    assert any(message == "Scanning 2 record cache files for index reuse..." for message in messages)
+    assert any(message.startswith("Record cache index progress: checked=1/2, usable=1") for message in messages)
+    assert any(message.startswith("Record cache index progress: checked=2/2, usable=2") for message in messages)
+    assert any(message == "Saving record cache index with 2 cached records..." for message in messages)
+
+
 def test_record_cache_index_reuses_persisted_metadata_for_unchanged_records(tmp_path: Path, monkeypatch) -> None:
     settings = Settings(cache_dir=tmp_path / "cache")
     record = make_record()
@@ -449,6 +488,7 @@ def test_fetch_sitemap_text_with_fallback_uses_curl_for_namespace_sitemaps(monke
 
 def test_discover_pages_with_limit_stops_after_enough_entries(tmp_path: Path, monkeypatch) -> None:
     settings = Settings(cache_dir=tmp_path / "cache")
+    messages: list[str] = []
     sitemap_index_xml = """<?xml version="1.0" encoding="UTF-8"?>
     <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
       <sitemap><loc>https://mzh.moegirl.org.cn/sitemap/sitemap-zhmoegirl-NS_0-0.xml</loc></sitemap>
@@ -477,11 +517,65 @@ def test_discover_pages_with_limit_stops_after_enough_entries(tmp_path: Path, mo
         "fetch_sitemaps_in_parallel",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("limited discovery should not fetch in parallel")),
     )
+    monkeypatch.setattr(fetcher, "log_status", messages.append)
 
     pages = fetcher.discover_pages(settings, object(), limit=1)
 
     assert [page.title_from_url for page in pages] == ["萌娘"]
     assert fetched_sitemaps == ["https://mzh.moegirl.org.cn/sitemap/sitemap-zhmoegirl-NS_0-0.xml"]
+    assert any(message == "Downloading sitemap index..." for message in messages)
+    assert any(message == "Found 2 namespace-zero sitemap files." for message in messages)
+    assert any(message.startswith("Downloading sitemap file 1/2 for limited fetch") for message in messages)
+    assert any(message.startswith("Sitemap download progress: 1/2 files") for message in messages)
+    assert any(message == "Reached discovery limit of 1 pages after 1/2 sitemap files." for message in messages)
+
+
+def test_discover_pages_emits_parallel_sitemap_progress(tmp_path: Path, monkeypatch) -> None:
+    settings = Settings(cache_dir=tmp_path / "cache", sitemap_concurrency=2)
+    messages: list[str] = []
+    sitemap_index_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <sitemap><loc>https://mzh.moegirl.org.cn/sitemap/sitemap-zhmoegirl-NS_0-0.xml</loc></sitemap>
+      <sitemap><loc>https://mzh.moegirl.org.cn/sitemap/sitemap-zhmoegirl-NS_0-1.xml</loc></sitemap>
+    </sitemapindex>
+    """
+    sitemap_xml_by_url = {
+        "https://mzh.moegirl.org.cn/sitemap/sitemap-zhmoegirl-NS_0-0.xml": """<?xml version="1.0" encoding="UTF-8"?>
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url>
+            <loc>https://mzh.moegirl.org.cn/%E8%90%8C%E5%A8%98</loc>
+            <lastmod>2026-04-28T00:00:00Z</lastmod>
+          </url>
+        </urlset>
+        """,
+        "https://mzh.moegirl.org.cn/sitemap/sitemap-zhmoegirl-NS_0-1.xml": """<?xml version="1.0" encoding="UTF-8"?>
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url>
+            <loc>https://mzh.moegirl.org.cn/%E8%88%B0%E9%98%9FCollection</loc>
+            <lastmod>2026-04-28T00:00:00Z</lastmod>
+          </url>
+        </urlset>
+        """,
+    }
+
+    monkeypatch.setattr(fetcher, "fetch_text_from_candidates", lambda *args, **kwargs: sitemap_index_xml)
+    monkeypatch.setattr(
+        fetcher,
+        "fetch_sitemap_text_with_fallback",
+        lambda session, url, settings: sitemap_xml_by_url[url],
+    )
+    monkeypatch.setattr(fetcher, "log_status", messages.append)
+
+    pages = fetcher.discover_pages(settings, object())
+
+    assert sorted(page.title_from_url for page in pages) == ["舰队Collection", "萌娘"]
+    assert any(message == "Downloading sitemap index..." for message in messages)
+    assert any(message == "Found 2 namespace-zero sitemap files." for message in messages)
+    assert any(message == "Downloading 2 sitemap files with 2 workers..." for message in messages)
+    assert any(message.startswith("Sitemap download progress: 1/2 files, workers=2") for message in messages)
+    assert any(message.startswith("Sitemap download progress: 2/2 files, workers=2") for message in messages)
+    assert any(message == "Parsing sitemap page entries..." for message in messages)
+    assert any(message == "Merging discovered pages with existing manifest..." for message in messages)
 
 
 def test_fetch_batch_splits_oversized_requests_and_preserves_order(monkeypatch) -> None:
@@ -827,5 +921,5 @@ def test_fetch_pages_emits_periodic_status_updates(tmp_path: Path, monkeypatch) 
     assert result[0].pageid == 1
     assert any(message.startswith("Discovering sitemap pages") for message in messages)
     assert any(message.startswith("Loading record cache index") for message in messages)
-    assert any(message.startswith("Fetching 1 pending pages across 1 batches") for message in messages)
+    assert any(message.startswith("Fetching pending pages: 1 pages, 1 batches") for message in messages)
     assert any(message.startswith("Fetch progress:") for message in messages)

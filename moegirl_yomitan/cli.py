@@ -86,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "package":
-        output_path = package_dictionary(settings)
+        output_path = package_dictionary(settings, progress=progress_to_stderr)
         print(f"Wrote dictionary archive to {output_path}")
         return 0
 
@@ -104,12 +104,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.from_cache:
-        output_path = package_dictionary(settings)
+        output_path = package_dictionary(settings, progress=progress_to_stderr)
         print(f"Rebuilt dictionary archive from cache: {output_path}")
         return 0
 
     pages = fetch_pages(settings, limit=args.limit)
-    output_path = package_dictionary(settings)
+    output_path = package_dictionary(settings, progress=progress_to_stderr)
     print(f"Built dictionary archive from {len(pages)} discovered pages: {output_path}")
     return 0
 
