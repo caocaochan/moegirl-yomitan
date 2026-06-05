@@ -138,6 +138,60 @@ def test_write_record_rewrites_changed_payload(tmp_path: Path, monkeypatch) -> N
     assert stored["summary"] == "新摘要。"
 
 
+def test_atomic_write_text_replaces_existing_file(tmp_path: Path) -> None:
+    path = tmp_path / "record.json"
+    path.write_text("old", encoding="utf-8")
+
+    fetcher.atomic_write_text(path, "new")
+
+    assert path.read_text(encoding="utf-8") == "new"
+    assert list(tmp_path.glob("record.json.*.tmp")) == []
+
+
+def test_atomic_write_text_retries_transient_replace_failure(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "record.json"
+    path.write_text("old", encoding="utf-8")
+    original_replace = type(path).replace
+    replace_calls = 0
+
+    def flaky_replace(self: Path, target: Path) -> Path:
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls == 1:
+            raise PermissionError("temporarily locked")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(type(path), "replace", flaky_replace)
+    monkeypatch.setattr(fetcher.time, "sleep", lambda seconds: None)
+
+    fetcher.atomic_write_text(path, "new")
+
+    assert replace_calls == 2
+    assert path.read_text(encoding="utf-8") == "new"
+    assert list(tmp_path.glob("record.json.*.tmp")) == []
+
+
+def test_atomic_write_text_cleans_up_temp_file_after_replace_failure(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "record.json"
+    path.write_text("old", encoding="utf-8")
+    replace_calls = 0
+
+    def failing_replace(self: Path, target: Path) -> Path:
+        nonlocal replace_calls
+        replace_calls += 1
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(type(path), "replace", failing_replace)
+    monkeypatch.setattr(fetcher.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(PermissionError):
+        fetcher.atomic_write_text(path, "new")
+
+    assert replace_calls == fetcher.ATOMIC_WRITE_REPLACE_ATTEMPTS
+    assert path.read_text(encoding="utf-8") == "old"
+    assert list(tmp_path.glob("record.json.*.tmp")) == []
+
+
 def test_old_record_json_loads_without_listed_links_and_is_marked_pending(tmp_path: Path) -> None:
     settings = Settings(cache_dir=tmp_path / "cache")
     record_path = record_path_for_page(settings, 1)

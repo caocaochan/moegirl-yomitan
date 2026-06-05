@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 from typing import Any, Callable, Iterable
+from uuid import uuid4
 
 import requests
 
@@ -31,6 +32,8 @@ CHECKPOINT_INTERVAL_SECONDS = 30.0
 CHECKPOINT_BATCH_INTERVAL = 100
 SLOW_CHECKPOINT_SECONDS = 1.0
 RECORD_CACHE_INDEX_PROGRESS_INTERVAL = 10_000
+ATOMIC_WRITE_REPLACE_ATTEMPTS = 5
+ATOMIC_WRITE_RETRY_SECONDS = 0.05
 SESSION_POOL_BATCH = "batch"
 SESSION_POOL_SITEMAP = "sitemap"
 RECORD_CACHE_INDEX_SCHEMA_VERSION = 2
@@ -1300,9 +1303,22 @@ def write_record(settings: Settings, record: SummaryRecord) -> None:
 
 
 def atomic_write_text(path: Path, content: str) -> None:
-    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
     temp_path.write_text(content, encoding="utf-8")
-    temp_path.replace(path)
+    try:
+        for attempt in range(ATOMIC_WRITE_REPLACE_ATTEMPTS):
+            try:
+                temp_path.replace(path)
+                return
+            except OSError:
+                if attempt == ATOMIC_WRITE_REPLACE_ATTEMPTS - 1:
+                    raise
+                time.sleep(ATOMIC_WRITE_RETRY_SECONDS)
+    finally:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
 
 
 def utc_now_iso() -> str:
