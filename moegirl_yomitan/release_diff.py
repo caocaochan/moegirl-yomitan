@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from html import escape
 from io import BytesIO
 import json
 from typing import Any
@@ -36,7 +37,7 @@ class ReleaseEntryDiff:
     added: list[ReleaseEntry]
 
 
-def build_latest_release_diff_markdown() -> str:
+def build_latest_release_diff_html() -> str:
     session = requests.Session()
     session.headers["User-Agent"] = USER_AGENT
     try:
@@ -47,7 +48,7 @@ def build_latest_release_diff_markdown() -> str:
     finally:
         session.close()
 
-    return render_release_diff_markdown(
+    return render_release_diff_html(
         ReleaseEntryDiff(
             base=base,
             head=head,
@@ -169,21 +170,42 @@ def diff_added_entries(base_entries: dict[int, ReleaseEntry], head_entries: dict
     return sorted((head_entries[pageid] for pageid in added_pageids), key=lambda entry: (entry.title.casefold(), entry.pageid))
 
 
-def render_release_diff_markdown(diff: ReleaseEntryDiff) -> str:
+def render_release_diff_html(diff: ReleaseEntryDiff) -> str:
+    title = f"Added entries in {diff.head.tag_name}"
     lines = [
-        f"## Added entries in {diff.head.tag_name}",
-        "",
-        f"Compared [{diff.base.tag_name}]({diff.base.html_url}) -> [{diff.head.tag_name}]({diff.head.html_url}).",
-        "",
-        f"Added entries: {len(diff.added)}",
+        "<!doctype html>",
+        '<html lang="en">',
+        "<head>",
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        f"<title>{escape(title)}</title>",
+        "<style>",
+        "body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;line-height:1.5;margin:2rem;max-width:72rem}",
+        "h1{font-size:1.8rem}a{color:#0969da}code{background:#f6f8fa;padding:.1rem .3rem;border-radius:.25rem}",
+        "li{margin:.25rem 0}",
+        "</style>",
+        "</head>",
+        "<body>",
+        f"<h1>{escape(title)}</h1>",
+        (
+            f'<p>Compared <a href="{escape(diff.base.html_url, quote=True)}">{escape(diff.base.tag_name)}</a> '
+            f'to <a href="{escape(diff.head.html_url, quote=True)}">{escape(diff.head.tag_name)}</a>.</p>'
+        ),
+        f"<p>Added entries: {len(diff.added)}</p>",
     ]
 
     if diff.added:
-        lines.append("")
+        lines.append("<ul>")
         for entry in diff.added:
-            title = f"[{entry.title}]({entry.article_url})" if entry.article_url else entry.title
-            lines.append(f"- {title} (`pageid={entry.pageid}`)")
+            title_text = escape(entry.title)
+            if entry.article_url:
+                rendered_title = f'<a href="{escape(entry.article_url, quote=True)}">{title_text}</a>'
+            else:
+                rendered_title = title_text
+            lines.append(f"<li>{rendered_title} <code>pageid={entry.pageid}</code></li>")
+        lines.append("</ul>")
     else:
-        lines.extend(["", "No added entries."])
+        lines.append("<p>No added entries.</p>")
 
+    lines.extend(["</body>", "</html>"])
     return "\n".join(lines)

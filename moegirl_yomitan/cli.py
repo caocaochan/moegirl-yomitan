@@ -7,7 +7,7 @@ import sys
 from .config import Settings
 from .fetcher import fetch_pages
 from .packaging import build_dictionary_content_fingerprint, load_last_build_fingerprint, package_dictionary, save_build_state
-from .release_diff import build_latest_release_diff_markdown
+from .release_diff import build_latest_release_diff_html
 
 
 def positive_float(value: str) -> float:
@@ -83,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "diff-releases":
-        print(build_latest_release_diff_markdown())
+        print(build_latest_release_diff_html())
         return 0
 
     settings = settings_from_args(args)

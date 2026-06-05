@@ -80,8 +80,29 @@ if not exist "dist\moegirl-yomitan-index.json" (
     exit /b 1
 )
 
+set "DIFF_HTML=dist\moegirl-yomitan-release-diff.html"
+set "RELEASE_NOTES=dist\moegirl-yomitan-release-notes.md"
+set "DIFF_URL=https://github.com/caocaochan/moegirl-yomitan/releases/download/%BUILD_VERSION%/moegirl-yomitan-release-diff.html"
+
+> "%RELEASE_NOTES%" echo Manual Yomitan dictionary build for version %BUILD_VERSION%.
+>> "%RELEASE_NOTES%" echo.
+>> "%RELEASE_NOTES%" echo Entries added: %DIFF_URL%
+
 echo Creating GitHub release %BUILD_VERSION% and uploading release assets...
-gh release create "%BUILD_VERSION%" "dist\moegirl-yomitan.zip" "dist\moegirl-yomitan-index.json" --title "%BUILD_VERSION%" --notes "Manual Yomitan dictionary build for version %BUILD_VERSION%."
+gh release create "%BUILD_VERSION%" "dist\moegirl-yomitan.zip" "dist\moegirl-yomitan-index.json" --title "%BUILD_VERSION%" --notes-file "%RELEASE_NOTES%"
+if errorlevel 1 exit /b 1
+
+echo Generating release entry diff HTML...
+python -m moegirl_yomitan diff-releases > "%DIFF_HTML%"
+if errorlevel 1 exit /b 1
+
+if not exist "%DIFF_HTML%" (
+    echo ERROR: %DIFF_HTML% was not created.
+    exit /b 1
+)
+
+echo Uploading release entry diff HTML...
+gh release upload "%BUILD_VERSION%" "%DIFF_HTML%"
 if errorlevel 1 exit /b 1
 
 echo Saving released build state...

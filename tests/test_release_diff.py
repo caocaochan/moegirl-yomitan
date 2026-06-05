@@ -10,7 +10,7 @@ from moegirl_yomitan.release_diff import (
     ReleaseEntryDiff,
     diff_added_entries,
     load_release_entries,
-    render_release_diff_markdown,
+    render_release_diff_html,
     select_latest_two_dictionary_releases,
 )
 
@@ -120,8 +120,8 @@ def test_diff_added_entries_uses_pageids_and_sorts_by_title() -> None:
     assert [(entry.pageid, entry.title) for entry in added] == [(3, "乙"), (4, "甲")]
 
 
-def test_render_release_diff_markdown_includes_versions_count_and_entries() -> None:
-    markdown = render_release_diff_markdown(
+def test_render_release_diff_html_includes_versions_count_and_entries() -> None:
+    html = render_release_diff_html(
         ReleaseEntryDiff(
             base=ReleaseAsset("2026.05.12", "https://example.invalid/base", "https://example.invalid/base.zip"),
             head=ReleaseAsset("2026.06.05", "https://example.invalid/head", "https://example.invalid/head.zip"),
@@ -132,13 +132,23 @@ def test_render_release_diff_markdown_includes_versions_count_and_entries() -> N
         )
     )
 
-    assert markdown.splitlines() == [
-        "## Added entries in 2026.06.05",
-        "",
-        "Compared [2026.05.12](https://example.invalid/base) -> [2026.06.05](https://example.invalid/head).",
-        "",
-        "Added entries: 2",
-        "",
-        "- [甲](https://example.invalid/4) (`pageid=4`)",
-        "- 乙 (`pageid=3`)",
-    ]
+    assert "<!doctype html>" in html
+    assert "<title>Added entries in 2026.06.05</title>" in html
+    assert '<a href="https://example.invalid/base">2026.05.12</a>' in html
+    assert '<a href="https://example.invalid/head">2026.06.05</a>' in html
+    assert "<p>Added entries: 2</p>" in html
+    assert '<li><a href="https://example.invalid/4">甲</a> <code>pageid=4</code></li>' in html
+    assert "<li>乙 <code>pageid=3</code></li>" in html
+
+
+def test_render_release_diff_html_escapes_entry_text() -> None:
+    html = render_release_diff_html(
+        ReleaseEntryDiff(
+            base=ReleaseAsset("2026.05.12", "https://example.invalid/base", "https://example.invalid/base.zip"),
+            head=ReleaseAsset("2026.06.05", "https://example.invalid/head", "https://example.invalid/head.zip"),
+            added=[ReleaseEntry(pageid=5, title="<script>", article_url='https://example.invalid/"quoted"')],
+        )
+    )
+
+    assert "&lt;script&gt;" in html
+    assert 'href="https://example.invalid/&quot;quoted&quot;"' in html
