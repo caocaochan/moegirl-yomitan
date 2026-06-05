@@ -145,6 +145,15 @@ def test_save_build_state_command_writes_structured_state(tmp_path: Path, capsys
     assert list(state["record_fingerprints"]) == ["1"]
 
 
+def test_diff_releases_prints_markdown(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "build_latest_release_diff_markdown", lambda: "## Added entries in 2026.06.05")
+
+    result = cli.main(["diff-releases"])
+
+    assert result == 0
+    assert capsys.readouterr().out.strip() == "## Added entries in 2026.06.05"
+
+
 def write_single_page_cache(tmp_path: Path) -> Settings:
     settings = Settings(
         cache_dir=tmp_path / "cache",

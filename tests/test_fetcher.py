@@ -4,6 +4,7 @@ import json
 import subprocess
 import time
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 import requests
@@ -21,6 +22,7 @@ from moegirl_yomitan.fetcher import (
     write_record,
 )
 from moegirl_yomitan.models import ManifestPage, SummaryRecord
+from moegirl_yomitan.packaging import package_dictionary
 
 
 @pytest.fixture(autouse=True)
@@ -340,6 +342,77 @@ def test_fetch_pages_second_run_keeps_cached_record_mtime(tmp_path: Path, monkey
 
     assert fetch_calls == 1
     assert record_path.stat().st_mtime_ns == first_mtime
+
+
+def test_full_fetch_and_package_retain_entries_removed_from_sitemap(tmp_path: Path, monkeypatch) -> None:
+    settings = Settings(
+        cache_dir=tmp_path / "cache",
+        output_zip=tmp_path / "dist" / "moegirl.zip",
+        batch_size=2,
+        concurrency=1,
+        sitemap_concurrency=1,
+    )
+    first_page = make_page_with_title("甲")
+    second_page = make_page_with_title("乙")
+    records_by_title = {
+        first_page.title_from_url: make_record_for_page(first_page, pageid=1),
+        second_page.title_from_url: make_record_for_page(second_page, pageid=2),
+    }
+    sitemap_index_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <sitemap><loc>https://mzh.moegirl.org.cn/sitemap/sitemap-zhmoegirl-NS_0-0.xml</loc></sitemap>
+    </sitemapindex>
+    """
+    sitemap_runs = [
+        """<?xml version="1.0" encoding="UTF-8"?>
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url>
+            <loc>https://mzh.moegirl.org.cn/甲</loc>
+            <lastmod>2026-04-28T00:00:00Z</lastmod>
+          </url>
+          <url>
+            <loc>https://mzh.moegirl.org.cn/乙</loc>
+            <lastmod>2026-04-28T00:00:00Z</lastmod>
+          </url>
+        </urlset>
+        """,
+        """<?xml version="1.0" encoding="UTF-8"?>
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url>
+            <loc>https://mzh.moegirl.org.cn/甲</loc>
+            <lastmod>2026-04-28T00:00:00Z</lastmod>
+          </url>
+        </urlset>
+        """,
+    ]
+    sitemap_run_index = 0
+
+    monkeypatch.setattr(fetcher, "fetch_text_from_candidates", lambda *args, **kwargs: sitemap_index_xml)
+
+    def fake_fetch_sitemap_text_with_fallback(session, url: str, settings: Settings) -> str:
+        return sitemap_runs[sitemap_run_index]
+
+    def fake_fetch_batch(settings: Settings, batch: list[ManifestPage]) -> list[SummaryRecord | None]:
+        return [records_by_title[page.title_from_url] for page in batch]
+
+    monkeypatch.setattr(fetcher, "fetch_sitemap_text_with_fallback", fake_fetch_sitemap_text_with_fallback)
+    monkeypatch.setattr(fetcher, "fetch_batch", fake_fetch_batch)
+
+    first_pages = fetch_pages(settings)
+    assert {page.canonical_title for page in first_pages} == {"甲", "乙"}
+
+    sitemap_run_index = 1
+    second_pages = fetch_pages(settings)
+
+    assert {page.canonical_title for page in second_pages} == {"甲", "乙"}
+    manifest = json.loads(settings.manifest_path.read_text(encoding="utf-8"))
+    assert {page["canonical_title"] for page in manifest["pages"]} == {"甲", "乙"}
+
+    output_path = package_dictionary(settings)
+    with ZipFile(output_path) as archive:
+        term_data = json.loads(archive.read("term_bank_1.json").decode("utf-8"))
+
+    assert {entry[0] for entry in term_data} == {"甲", "乙"}
 
 
 def test_fetch_extract_payload_uses_post(monkeypatch) -> None:

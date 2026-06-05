@@ -7,6 +7,7 @@ import sys
 from .config import Settings
 from .fetcher import fetch_pages
 from .packaging import build_dictionary_content_fingerprint, load_last_build_fingerprint, package_dictionary, save_build_state
+from .release_diff import build_latest_release_diff_markdown
 
 
 def positive_float(value: str) -> float:
@@ -38,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     for command in ("fetch", "package", "check-build-change"):
         subparser = subparsers.add_parser(command)
         add_common_arguments(subparser)
+
+    subparsers.add_parser("diff-releases")
 
     save_state_parser = subparsers.add_parser("save-build-state")
     add_common_arguments(save_state_parser)
@@ -78,6 +81,11 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "diff-releases":
+        print(build_latest_release_diff_markdown())
+        return 0
+
     settings = settings_from_args(args)
 
     if args.command == "fetch":

@@ -295,7 +295,7 @@ def discover_pages(settings: Settings, session: requests.Session, limit: int | N
 
     log_status("Merging discovered pages with existing manifest...")
     previous_pages = {page.source_url: page for page in load_manifest(settings)}
-    return merge_manifest_pages(discovered, previous_pages)
+    return merge_manifest_pages(discovered, previous_pages, retain_previous=limit is None)
 
 
 def load_manifest_payload(settings: Settings) -> dict:

@@ -87,9 +87,16 @@ def canonical_article_url(title: str) -> str:
     return urlunsplit((split.scheme, split.netloc, split.path, split.query, split.fragment))
 
 
-def merge_manifest_pages(current_pages: Iterable[ManifestPage], previous_pages: dict[str, ManifestPage]) -> list[ManifestPage]:
+def merge_manifest_pages(
+    current_pages: Iterable[ManifestPage],
+    previous_pages: dict[str, ManifestPage],
+    *,
+    retain_previous: bool = False,
+) -> list[ManifestPage]:
     merged: list[ManifestPage] = []
+    current_source_urls: set[str] = set()
     for page in current_pages:
+        current_source_urls.add(page.source_url)
         previous = previous_pages.get(page.source_url)
         if previous is not None:
             page.pageid = previous.pageid
@@ -97,5 +104,7 @@ def merge_manifest_pages(current_pages: Iterable[ManifestPage], previous_pages: 
             page.article_url = previous.article_url
             page.record_path = previous.record_path
         merged.append(page)
+    if retain_previous:
+        merged.extend(page for source_url, page in previous_pages.items() if source_url not in current_source_urls)
     merged.sort(key=lambda item: item.source_url)
     return merged
