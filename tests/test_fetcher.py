@@ -149,7 +149,81 @@ def test_limited_record_cache_index_loads_only_referenced_records(tmp_path: Path
     index = fetcher.build_record_cache_index_for_pages(settings, [page])
 
     assert index.count == 1
-    assert record_for_page(page, index) == record
+    cached = record_for_page(page, index)
+    assert cached is not None
+    assert cached.pageid == record.pageid
+    assert cached.canonical_title == record.canonical_title
+    assert cached.source_url == record.source_url
+
+
+def test_record_cache_index_reuses_persisted_metadata_for_unchanged_records(tmp_path: Path, monkeypatch) -> None:
+    settings = Settings(cache_dir=tmp_path / "cache")
+    record = make_record()
+    write_record(settings, record)
+
+    first_index = build_record_cache_index(settings)
+    assert first_index.count == 1
+    assert settings.record_cache_index_path.exists()
+
+    def fail_load_record(record_path: Path) -> SummaryRecord | None:
+        raise AssertionError("unchanged record should have been reused from persisted index")
+
+    monkeypatch.setattr(fetcher, "load_record", fail_load_record)
+
+    second_index = build_record_cache_index(settings)
+
+    cached = record_for_page(make_page(), second_index)
+    assert cached is not None
+    assert cached.pageid == record.pageid
+    assert cached.canonical_title == record.canonical_title
+
+
+def test_record_cache_index_reparses_only_changed_records(tmp_path: Path, monkeypatch) -> None:
+    settings = Settings(cache_dir=tmp_path / "cache")
+    first_record = make_record()
+    second_page = make_page_with_title("乙")
+    second_record = make_record_for_page(second_page, pageid=2)
+    write_record(settings, first_record)
+    write_record(settings, second_record)
+    build_record_cache_index(settings)
+
+    changed_second_record = make_record_for_page(second_page, pageid=2, summary="这是新的较长摘要。")
+    write_record(settings, changed_second_record)
+    original_load_record = fetcher.load_record
+    load_calls: list[Path] = []
+
+    def tracking_load_record(record_path: Path) -> SummaryRecord | None:
+        load_calls.append(record_path)
+        return original_load_record(record_path)
+
+    monkeypatch.setattr(fetcher, "load_record", tracking_load_record)
+
+    index = build_record_cache_index(settings)
+
+    assert load_calls == [record_path_for_page(settings, changed_second_record.pageid)]
+    cached = record_for_page(second_page, index)
+    assert cached is not None
+    assert cached.pageid == changed_second_record.pageid
+
+
+def test_malformed_record_cache_index_falls_back_to_record_files(tmp_path: Path, monkeypatch) -> None:
+    settings = Settings(cache_dir=tmp_path / "cache")
+    record = make_record()
+    write_record(settings, record)
+    settings.record_cache_index_path.write_text("{not-json", encoding="utf-8")
+    original_load_record = fetcher.load_record
+    load_calls: list[Path] = []
+
+    def tracking_load_record(record_path: Path) -> SummaryRecord | None:
+        load_calls.append(record_path)
+        return original_load_record(record_path)
+
+    monkeypatch.setattr(fetcher, "load_record", tracking_load_record)
+
+    index = build_record_cache_index(settings)
+
+    assert load_calls == [record_path_for_page(settings, record.pageid)]
+    assert index.count == 1
 
 
 def test_fetch_pages_reuses_cached_record_when_manifest_is_incomplete(tmp_path: Path, monkeypatch) -> None:

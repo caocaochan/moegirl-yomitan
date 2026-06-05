@@ -49,5 +49,9 @@ class Settings:
         return self.cache_dir / "build-state.json"
 
     @property
+    def record_cache_index_path(self) -> Path:
+        return self.cache_dir / "record-cache-index.json"
+
+    @property
     def records_dir(self) -> Path:
         return self.cache_dir / "records"

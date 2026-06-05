@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 import threading
 import time
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 import requests
 
@@ -30,6 +30,7 @@ CHECKPOINT_BATCH_INTERVAL = 100
 SLOW_CHECKPOINT_SECONDS = 1.0
 SESSION_POOL_BATCH = "batch"
 SESSION_POOL_SITEMAP = "sitemap"
+RECORD_CACHE_INDEX_SCHEMA_VERSION = 1
 
 _THREAD_LOCAL = threading.local()
 _ACTIVE_SESSION_REGISTRIES: dict[str, list["SessionRegistry"]] = {
@@ -58,12 +59,69 @@ class AdaptiveState:
     cooldown_seconds: float = 0.0
 
 
+@dataclass(frozen=True)
+class CachedRecord:
+    pageid: int
+    canonical_title: str
+    article_url: str
+    source_url: str
+    lastmod: str
+    record_path: str
+    file_size: int
+    file_mtime_ns: int
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CachedRecord" | None:
+        try:
+            pageid = data["pageid"]
+            canonical_title = data["canonical_title"]
+            article_url = data["article_url"]
+            source_url = data["source_url"]
+            lastmod = data["lastmod"]
+            record_path = data["record_path"]
+            file_size = data["file_size"]
+            file_mtime_ns = data["file_mtime_ns"]
+        except KeyError:
+            return None
+
+        if not isinstance(pageid, int):
+            return None
+        string_values = (canonical_title, article_url, source_url, lastmod, record_path)
+        if not all(isinstance(value, str) for value in string_values):
+            return None
+        if not isinstance(file_size, int) or not isinstance(file_mtime_ns, int):
+            return None
+        return cls(
+            pageid=pageid,
+            canonical_title=canonical_title,
+            article_url=article_url,
+            source_url=source_url,
+            lastmod=lastmod,
+            record_path=record_path,
+            file_size=file_size,
+            file_mtime_ns=file_mtime_ns,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pageid": self.pageid,
+            "canonical_title": self.canonical_title,
+            "article_url": self.article_url,
+            "source_url": self.source_url,
+            "lastmod": self.lastmod,
+            "record_path": self.record_path,
+            "file_size": self.file_size,
+            "file_mtime_ns": self.file_mtime_ns,
+        }
+
+
 @dataclass
 class RecordCacheIndex:
-    by_source_url: dict[str, SummaryRecord]
-    by_pageid: dict[int, SummaryRecord]
-    by_canonical_title: dict[str, SummaryRecord]
+    by_source_url: dict[str, CachedRecord]
+    by_pageid: dict[int, CachedRecord]
+    by_canonical_title: dict[str, CachedRecord]
     count: int = 0
+    by_record_path: dict[str, CachedRecord] = field(default_factory=dict)
 
 
 @dataclass
@@ -225,30 +283,149 @@ def record_path_for_page(settings: Settings, pageid: int) -> Path:
     return settings.records_dir / f"{pageid}.json"
 
 
-def build_record_cache_index(settings: Settings) -> RecordCacheIndex:
-    if not settings.records_dir.exists():
-        return RecordCacheIndex({}, {}, {})
+def record_relative_path(settings: Settings, record_path: Path) -> str:
+    return record_path.relative_to(settings.cache_dir).as_posix()
 
-    by_source_url: dict[str, SummaryRecord] = {}
-    by_pageid: dict[int, SummaryRecord] = {}
-    by_canonical_title: dict[str, SummaryRecord] = {}
+
+def cached_record_from_record(settings: Settings, record: SummaryRecord, record_path: Path) -> CachedRecord:
+    record_stat = record_path.stat()
+    return CachedRecord(
+        pageid=record.pageid,
+        canonical_title=record.canonical_title,
+        article_url=record.article_url,
+        source_url=record.source_url,
+        lastmod=record.lastmod,
+        record_path=record_relative_path(settings, record_path),
+        file_size=record_stat.st_size,
+        file_mtime_ns=record_stat.st_mtime_ns,
+    )
+
+
+def make_record_cache_index(records: Iterable[CachedRecord]) -> RecordCacheIndex:
+    by_source_url: dict[str, CachedRecord] = {}
+    by_pageid: dict[int, CachedRecord] = {}
+    by_canonical_title: dict[str, CachedRecord] = {}
+    by_record_path: dict[str, CachedRecord] = {}
     count = 0
 
-    for record_path in sorted(settings.records_dir.glob("*.json")):
-        record = load_record(record_path)
-        if record is None:
-            continue
+    for record in records:
         count += 1
         by_source_url.setdefault(record.source_url, record)
         by_pageid.setdefault(record.pageid, record)
         by_canonical_title.setdefault(record.canonical_title, record)
+        by_record_path[record.record_path] = record
 
     return RecordCacheIndex(
         by_source_url=by_source_url,
         by_pageid=by_pageid,
         by_canonical_title=by_canonical_title,
         count=count,
+        by_record_path=by_record_path,
     )
+
+
+def load_persisted_record_cache_entries(settings: Settings) -> dict[str, CachedRecord]:
+    if not settings.record_cache_index_path.exists():
+        return {}
+    try:
+        data = json.loads(settings.record_cache_index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict) or data.get("schema_version") != RECORD_CACHE_INDEX_SCHEMA_VERSION:
+        return {}
+
+    raw_records = data.get("records")
+    if not isinstance(raw_records, dict):
+        return {}
+
+    records: dict[str, CachedRecord] = {}
+    for key, value in raw_records.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        record = CachedRecord.from_dict(value)
+        if record is not None and record.record_path == key:
+            records[key] = record
+    return records
+
+
+def cached_record_matches_path(cached: CachedRecord, relative_record_path: str, record_stat) -> bool:
+    return (
+        cached.record_path == relative_record_path
+        and cached.file_size == record_stat.st_size
+        and cached.file_mtime_ns == record_stat.st_mtime_ns
+    )
+
+
+def save_record_cache_index(settings: Settings, record_index: RecordCacheIndex) -> None:
+    settings.cache_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(
+        settings.record_cache_index_path,
+        json.dumps(
+            {
+                "schema_version": RECORD_CACHE_INDEX_SCHEMA_VERSION,
+                "records": {
+                    path: record.to_dict()
+                    for path, record in sorted(record_index.by_record_path.items())
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
+    )
+
+
+def add_record_to_cache_index(settings: Settings, record_index: RecordCacheIndex, record: SummaryRecord) -> bool:
+    record_path = record_path_for_page(settings, record.pageid)
+    try:
+        cached = cached_record_from_record(settings, record, record_path)
+    except OSError:
+        return False
+
+    existing = record_index.by_record_path.get(cached.record_path)
+    if existing is None:
+        record_index.count += 1
+    else:
+        if record_index.by_source_url.get(existing.source_url) == existing:
+            del record_index.by_source_url[existing.source_url]
+        if record_index.by_pageid.get(existing.pageid) == existing:
+            del record_index.by_pageid[existing.pageid]
+        if record_index.by_canonical_title.get(existing.canonical_title) == existing:
+            del record_index.by_canonical_title[existing.canonical_title]
+
+    record_index.by_record_path[cached.record_path] = cached
+    record_index.by_source_url.setdefault(cached.source_url, cached)
+    record_index.by_pageid.setdefault(cached.pageid, cached)
+    record_index.by_canonical_title.setdefault(cached.canonical_title, cached)
+    return existing is None
+
+
+def build_record_cache_index(settings: Settings) -> RecordCacheIndex:
+    if not settings.records_dir.exists():
+        return RecordCacheIndex({}, {}, {})
+
+    persisted_records = load_persisted_record_cache_entries(settings)
+    records: list[CachedRecord] = []
+
+    for record_path in sorted(settings.records_dir.glob("*.json")):
+        try:
+            record_stat = record_path.stat()
+        except OSError:
+            continue
+        relative_record_path = record_relative_path(settings, record_path)
+        cached = persisted_records.get(relative_record_path)
+        if cached is not None and cached_record_matches_path(cached, relative_record_path, record_stat):
+            records.append(cached)
+            continue
+
+        record = load_record(record_path)
+        if record is None:
+            continue
+        records.append(cached_record_from_record(settings, record, record_path))
+
+    index = make_record_cache_index(records)
+    save_record_cache_index(settings, index)
+    return index
 
 
 def build_record_cache_index_for_pages(settings: Settings, pages: Iterable[ManifestPage]) -> RecordCacheIndex:
@@ -265,24 +442,27 @@ def build_record_cache_index_for_pages(settings: Settings, pages: Iterable[Manif
     if not record_paths:
         return build_record_cache_index(settings)
 
-    records = [record for path in sorted(record_paths) if (record := load_record(path)) is not None]
-    by_source_url: dict[str, SummaryRecord] = {}
-    by_pageid: dict[int, SummaryRecord] = {}
-    by_canonical_title: dict[str, SummaryRecord] = {}
-    for record in records:
-        by_source_url.setdefault(record.source_url, record)
-        by_pageid.setdefault(record.pageid, record)
-        by_canonical_title.setdefault(record.canonical_title, record)
+    persisted_records = load_persisted_record_cache_entries(settings)
+    records: list[CachedRecord] = []
+    for path in sorted(record_paths):
+        try:
+            record_stat = path.stat()
+        except OSError:
+            continue
+        relative_record_path = record_relative_path(settings, path)
+        cached = persisted_records.get(relative_record_path)
+        if cached is not None and cached_record_matches_path(cached, relative_record_path, record_stat):
+            records.append(cached)
+            continue
 
-    return RecordCacheIndex(
-        by_source_url=by_source_url,
-        by_pageid=by_pageid,
-        by_canonical_title=by_canonical_title,
-        count=len(records),
-    )
+        record = load_record(path)
+        if record is not None:
+            records.append(cached_record_from_record(settings, record, path))
+
+    return make_record_cache_index(records)
 
 
-def record_for_page(page: ManifestPage, record_index: RecordCacheIndex) -> SummaryRecord | None:
+def record_for_page(page: ManifestPage, record_index: RecordCacheIndex) -> CachedRecord | None:
     record = record_index.by_source_url.get(page.source_url)
     if record is not None:
         return record
@@ -297,9 +477,8 @@ def record_for_page(page: ManifestPage, record_index: RecordCacheIndex) -> Summa
     return record_index.by_canonical_title.get(page.title_from_url)
 
 
-def hydrate_page_from_record(settings: Settings, page: ManifestPage, record: SummaryRecord) -> bool:
+def hydrate_page_from_record(settings: Settings, page: ManifestPage, record: CachedRecord) -> bool:
     changed = False
-    record_path = record_path_for_page(settings, record.pageid).relative_to(settings.cache_dir).as_posix()
 
     if page.pageid != record.pageid:
         page.pageid = record.pageid
@@ -310,8 +489,8 @@ def hydrate_page_from_record(settings: Settings, page: ManifestPage, record: Sum
     if page.article_url != record.article_url:
         page.article_url = record.article_url
         changed = True
-    if page.record_path != record_path:
-        page.record_path = record_path
+    if page.record_path != record.record_path:
+        page.record_path = record.record_path
         changed = True
 
     return changed
@@ -332,7 +511,7 @@ def hydrate_pages_from_record_cache(
     return hydrated
 
 
-def page_needs_fetch(page: ManifestPage, record: SummaryRecord | None) -> bool:
+def page_needs_fetch(page: ManifestPage, record: CachedRecord | None) -> bool:
     if record is None:
         return True
     if record.lastmod != page.lastmod:
@@ -398,6 +577,8 @@ def fetch_pages(settings: Settings, limit: int | None = None) -> list[ManifestPa
     log_status(f"Fetching {len(pending)} pending pages across {len(batches)} batches.")
     save_manifest_checkpoint(settings, pages, progress_state, force=True)
     run_adaptive_fetch_loop(settings, pages, batches, progress_state, record_index)
+    if limit is None:
+        save_record_cache_index(settings, record_index)
     save_manifest_checkpoint(settings, pages, progress_state, force=True)
     return pages
 
@@ -441,13 +622,15 @@ def run_adaptive_fetch_loop(
                 for page, record in zip(task.pages, records):
                     if record is None:
                         continue
+                    is_new_pageid = record.pageid not in record_index.by_pageid
                     write_record(settings, record)
+                    add_record_to_cache_index(settings, record_index, record)
                     page.pageid = record.pageid
                     page.canonical_title = record.canonical_title
                     page.article_url = record.article_url
                     page.record_path = record_path_for_page(settings, record.pageid).relative_to(settings.cache_dir).as_posix()
                     progress_state.records_fetched += 1
-                    if record.pageid not in record_index.by_pageid:
+                    if is_new_pageid:
                         progress_state.new_pageids_seen.add(record.pageid)
 
                 progress_state.successful_batches += 1
