@@ -93,7 +93,11 @@ def test_alias_term_for_title_trims_whitespace_before_fullwidth_suffix() -> None
     assert alias_term_for_title("绿坝娘 （和谐大色狼）") == "绿坝娘"
 
 
-def test_build_term_entries_does_not_add_alias_for_ascii_parentheses() -> None:
+def test_alias_term_for_title_trims_ascii_parenthetical_suffix() -> None:
+    assert alias_term_for_title("日向葵(声优)") == "日向葵"
+
+
+def test_build_term_entries_adds_ascii_parenthetical_alias() -> None:
     record = type(
         "Record",
         (),
@@ -108,9 +112,11 @@ def test_build_term_entries_does_not_add_alias_for_ascii_parentheses() -> None:
         },
     )()
     entries = build_term_entries(record)
-    assert len(entries) == 1
-    assert entries[0][0] == "小林(希德尼娅的骑士)"
-    assert entries[0][1] == "xiǎo lín(xī dé ní yà de qí shì)"
+    assert [entry[0] for entry in entries] == ["小林(希德尼娅的骑士)", "小林"]
+    assert [entry[1] for entry in entries] == ["xiǎo lín(xī dé ní yà de qí shì)", "xiǎo lín"]
+    assert [entry[4] for entry in entries] == [0, -1]
+    assert [entry[6] for entry in entries] == [100063, 100063]
+    assert entries[0][5] == entries[1][5]
 
 
 def test_term_reading_for_term_keeps_mixed_script_punctuation_inline() -> None:

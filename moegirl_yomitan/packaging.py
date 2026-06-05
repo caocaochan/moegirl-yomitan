@@ -16,7 +16,7 @@ from .fetcher import atomic_write_text, load_manifest, load_record, record_path_
 from .models import SummaryRecord
 from .versioning import resolve_build_version
 
-FULLWIDTH_ALIAS_PATTERN = re.compile(r"^(?P<base>.+?)（[^（）]+）$")
+PARENTHETICAL_ALIAS_PATTERN = re.compile(r"^(?P<base>.+?)(?:（[^（）()]+）|\([^（）()]+\))$")
 HANZI_RUN_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 READING_COLLAPSE_SPACE_PATTERN = re.compile(r"\s+")
 READING_SPACE_BEFORE_PUNCTUATION_PATTERN = re.compile(r"\s+([,.:;!?%)\]}>:：；，。！？、）】》」』])")
@@ -25,7 +25,7 @@ READING_SPACE_AFTER_OPENING_PATTERN = re.compile(r"([(\[<{（【《「『])\s+")
 READING_PUNCTUATION_WITH_TRAILING_SPACE_PATTERN = re.compile(r"([,.:;!?:：；，。！？、])(?=\S)")
 STRUCTURED_CONTENT_LANG = "zh-Hans"
 BUILD_STATE_SCHEMA_VERSION = 2
-FINGERPRINT_ALGORITHM_VERSION = "packaged-content-v2"
+FINGERPRINT_ALGORITHM_VERSION = "packaged-content-v3"
 _PINYIN_DATA_READY = False
 ProgressReporter = Callable[[str], None]
 
@@ -392,7 +392,7 @@ def build_term_entry_for_term(record: SummaryRecord, term: str, score: int = 0) 
 
 
 def alias_term_for_title(title: str) -> str | None:
-    match = FULLWIDTH_ALIAS_PATTERN.fullmatch(title)
+    match = PARENTHETICAL_ALIAS_PATTERN.fullmatch(title)
     if match is None:
         return None
 
