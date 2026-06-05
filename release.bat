@@ -48,8 +48,7 @@ for /f "usebackq tokens=1,* delims==" %%A in ("%CHANGE_FILE%") do (
 del "%CHANGE_FILE%" >nul 2>nul
 
 if /i not "%CHANGED%"=="true" (
-    echo No packaged content changes detected. No release needed.
-    exit /b 0
+    echo No packaged content changes detected. Continuing with forced release.
 )
 
 if "%~1"=="" (

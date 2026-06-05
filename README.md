@@ -49,7 +49,8 @@ python -m moegirl_yomitan check-build-change
 python -c "from moegirl_yomitan.versioning import resolve_build_version; print(resolve_build_version())"
 ```
 
-If `check-build-change` prints `changed=false`, no release is needed.
+If `check-build-change` prints `changed=false`, packaged content is unchanged; `release.bat`
+still publishes a forced release when run.
 
 Package a changed build with the resolved version. In PowerShell:
 

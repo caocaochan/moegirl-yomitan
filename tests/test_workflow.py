@@ -32,5 +32,7 @@ def test_release_script_saves_build_state_after_successful_release() -> None:
     ) in release_script
     assert "Manual Yomitan dictionary build for version %BUILD_VERSION%." in release_script
     assert "Entries added: %DIFF_URL%" in release_script
+    assert "Continuing with forced release." in release_script
+    assert "No release needed." not in release_script
     assert 'gh release create "%BUILD_VERSION%" "dist\\moegirl-yomitan.zip" "dist\\moegirl-yomitan-index.json" --title "%BUILD_VERSION%" --notes-file "%RELEASE_NOTES%"' in release_script
     assert 'save-build-state --fingerprint "%FINGERPRINT%"' in release_script
