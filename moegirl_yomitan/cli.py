@@ -7,7 +7,7 @@ import sys
 from .config import Settings
 from .fetcher import fetch_pages
 from .packaging import build_dictionary_content_fingerprint, load_last_build_fingerprint, package_dictionary, save_build_state
-from .release_diff import build_latest_release_diff_html
+from .release_diff import build_release_diff_html
 
 
 def positive_float(value: str) -> float:
@@ -40,7 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
         subparser = subparsers.add_parser(command)
         add_common_arguments(subparser)
 
-    subparsers.add_parser("diff-releases")
+    diff_parser = subparsers.add_parser("diff-releases")
+    diff_parser.add_argument("--head-version", required=True, help="Build version represented by the local head archive.")
+    diff_parser.add_argument("--head-zip", type=Path, required=True, help="Local dictionary archive for the head build.")
 
     save_state_parser = subparsers.add_parser("save-build-state")
     add_common_arguments(save_state_parser)
@@ -83,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "diff-releases":
-        print(build_latest_release_diff_html())
+        print(build_release_diff_html(head_version=args.head_version, head_zip=args.head_zip))
         return 0
 
     settings = settings_from_args(args)

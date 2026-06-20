@@ -4,14 +4,16 @@ from zipfile import ZipFile
 
 import pytest
 
+import moegirl_yomitan.release_diff as release_diff
 from moegirl_yomitan.release_diff import (
     ReleaseAsset,
     ReleaseEntry,
     ReleaseEntryDiff,
+    build_release_diff_html,
     diff_added_entries,
     load_release_entries,
     render_release_diff_html,
-    select_latest_two_dictionary_releases,
+    select_base_dictionary_release,
 )
 
 
@@ -59,27 +61,53 @@ def make_zip(term_banks: dict[str, list]) -> bytes:
     return buffer.getvalue()
 
 
-def test_select_latest_two_dictionary_releases_ignores_drafts() -> None:
-    base, head = select_latest_two_dictionary_releases(
+def test_select_base_dictionary_release_uses_highest_lower_semantic_version() -> None:
+    base = select_base_dictionary_release(
         [
-            make_release("draft", draft=True),
-            make_release("2026.06.05"),
+            make_release("2026.06.20"),
+            make_release("not-a-version"),
+            make_release("2026.06.19", draft=True),
+            make_release("2026.06.18", asset_name="other.zip"),
             make_release("2026.05.12"),
-        ]
+            make_release("2026.06.05.1"),
+            make_release("2026.06.05.2"),
+            make_release("2026.06.05"),
+        ],
+        head_version="2026.06.20",
     )
 
-    assert base.tag_name == "2026.05.12"
-    assert head.tag_name == "2026.06.05"
+    assert base.tag_name == "2026.06.05.2"
 
 
-def test_select_latest_two_dictionary_releases_requires_dictionary_asset() -> None:
-    with pytest.raises(ValueError, match="does not include moegirl-yomitan.zip"):
-        select_latest_two_dictionary_releases(
+def test_select_base_dictionary_release_requires_an_earlier_dictionary_release() -> None:
+    with pytest.raises(ValueError, match="No published dictionary release exists before 2026.06.20"):
+        select_base_dictionary_release(
             [
-                make_release("2026.06.05", asset_name="other.zip"),
-                make_release("2026.05.12"),
-            ]
+                make_release("2026.06.20"),
+                make_release("2026.06.19", draft=True),
+                make_release("2026.06.18", asset_name="other.zip"),
+                make_release("invalid"),
+            ],
+            head_version="2026.06.20",
         )
+
+
+def test_build_release_diff_html_uses_local_head_zip(tmp_path, monkeypatch) -> None:
+    base_zip = make_zip({"term_bank_1.json": [make_term_entry("旧条目", 1)]})
+    head_zip = tmp_path / "head.zip"
+    head_zip.write_bytes(
+        make_zip({"term_bank_1.json": [make_term_entry("旧条目", 1), make_term_entry("新条目", 2)]})
+    )
+    monkeypatch.setattr(release_diff, "fetch_github_releases", lambda session: [make_release("2026.06.05.2")])
+    monkeypatch.setattr(release_diff, "download_release_asset", lambda session, release: base_zip)
+
+    html = build_release_diff_html(head_version="2026.06.20", head_zip=head_zip)
+
+    assert "<title>Added entries in 2026.06.20</title>" in html
+    assert ">2026.06.05.2</a>" in html
+    assert ">2026.06.20</a>" in html
+    assert "<p>Added entries: 1</p>" in html
+    assert "新条目" in html
 
 
 def test_load_release_entries_reads_term_banks_and_ignores_duplicate_alias_rows() -> None:

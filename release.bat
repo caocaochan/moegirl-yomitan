@@ -87,12 +87,8 @@ set "DIFF_URL=https://github.com/caocaochan/moegirl-yomitan/releases/download/%B
 >> "%RELEASE_NOTES%" echo.
 >> "%RELEASE_NOTES%" echo Entries added: %DIFF_URL%
 
-echo Creating GitHub release %BUILD_VERSION% and uploading release assets...
-gh release create "%BUILD_VERSION%" "dist\moegirl-yomitan.zip" "dist\moegirl-yomitan-index.json" --title "%BUILD_VERSION%" --notes-file "%RELEASE_NOTES%"
-if errorlevel 1 exit /b 1
-
 echo Generating release entry diff HTML...
-python -m moegirl_yomitan diff-releases > "%DIFF_HTML%"
+python -m moegirl_yomitan diff-releases --head-version "%BUILD_VERSION%" --head-zip "dist\moegirl-yomitan.zip" > "%DIFF_HTML%"
 if errorlevel 1 exit /b 1
 
 if not exist "%DIFF_HTML%" (
@@ -100,8 +96,8 @@ if not exist "%DIFF_HTML%" (
     exit /b 1
 )
 
-echo Uploading release entry diff HTML...
-gh release upload "%BUILD_VERSION%" "%DIFF_HTML%"
+echo Creating GitHub release %BUILD_VERSION% and uploading release assets...
+gh release create "%BUILD_VERSION%" "dist\moegirl-yomitan.zip" "dist\moegirl-yomitan-index.json" "%DIFF_HTML%" --title "%BUILD_VERSION%" --notes-file "%RELEASE_NOTES%"
 if errorlevel 1 exit /b 1
 
 echo Saving released build state...

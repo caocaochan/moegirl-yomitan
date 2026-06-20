@@ -146,11 +146,17 @@ def test_save_build_state_command_writes_structured_state(tmp_path: Path, capsys
 
 
 def test_diff_releases_prints_html(monkeypatch, capsys) -> None:
-    monkeypatch.setattr(cli, "build_latest_release_diff_html", lambda: "<!doctype html>")
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "build_release_diff_html",
+        lambda **kwargs: calls.append(kwargs) or "<!doctype html>",
+    )
 
-    result = cli.main(["diff-releases"])
+    result = cli.main(["diff-releases", "--head-version", "2026.06.20", "--head-zip", "head.zip"])
 
     assert result == 0
+    assert calls == [{"head_version": "2026.06.20", "head_zip": Path("head.zip")}]
     assert capsys.readouterr().out.strip() == "<!doctype html>"
 
 

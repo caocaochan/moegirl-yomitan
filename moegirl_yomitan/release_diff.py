@@ -4,10 +4,13 @@ from dataclasses import dataclass
 from html import escape
 from io import BytesIO
 import json
+from pathlib import Path
 from typing import Any
 from zipfile import ZipFile
 
 import requests
+
+from .versioning import BUILD_VERSION_PATTERN
 
 
 GITHUB_REPOSITORY = "caocaochan/moegirl-yomitan"
@@ -37,17 +40,27 @@ class ReleaseEntryDiff:
     added: list[ReleaseEntry]
 
 
-def build_latest_release_diff_html() -> str:
+def build_release_diff_html(*, head_version: str, head_zip: Path) -> str:
+    if build_version_sort_key(head_version) is None:
+        raise ValueError(f"Invalid build version: {head_version}")
+
     session = requests.Session()
     session.headers["User-Agent"] = USER_AGENT
     try:
         releases = fetch_github_releases(session)
-        base, head = select_latest_two_dictionary_releases(releases)
+        base = select_base_dictionary_release(releases, head_version=head_version)
         base_entries = load_release_entries(download_release_asset(session, base))
-        head_entries = load_release_entries(download_release_asset(session, head))
+        head_entries = load_release_entries(head_zip.read_bytes())
     finally:
         session.close()
 
+    head = ReleaseAsset(
+        tag_name=head_version,
+        html_url=f"https://github.com/{GITHUB_REPOSITORY}/releases/tag/{head_version}",
+        download_url=(
+            f"https://github.com/{GITHUB_REPOSITORY}/releases/download/{head_version}/{DICTIONARY_ASSET_NAME}"
+        ),
+    )
     return render_release_diff_html(
         ReleaseEntryDiff(
             base=base,
@@ -58,7 +71,7 @@ def build_latest_release_diff_html() -> str:
 
 
 def fetch_github_releases(session: requests.Session) -> list[dict[str, Any]]:
-    response = session.get(f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases", params={"per_page": "10"})
+    response = session.get(f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases", params={"per_page": "100"})
     response.raise_for_status()
     data = response.json()
     if not isinstance(data, list):
@@ -66,14 +79,39 @@ def fetch_github_releases(session: requests.Session) -> list[dict[str, Any]]:
     return data
 
 
-def select_latest_two_dictionary_releases(releases: list[dict[str, Any]]) -> tuple[ReleaseAsset, ReleaseAsset]:
-    published = [release for release in releases if not release.get("draft")]
-    if len(published) < 2:
-        raise ValueError("At least two published GitHub releases are required.")
+def select_base_dictionary_release(releases: list[dict[str, Any]], *, head_version: str) -> ReleaseAsset:
+    head_key = build_version_sort_key(head_version)
+    if head_key is None:
+        raise ValueError(f"Invalid build version: {head_version}")
 
-    head = release_asset_from_release(published[0])
-    base = release_asset_from_release(published[1])
-    return base, head
+    candidates: list[tuple[tuple[int, int, int, int], ReleaseAsset]] = []
+    for release in releases:
+        if release.get("draft"):
+            continue
+        tag_name = release.get("tag_name")
+        if not isinstance(tag_name, str):
+            continue
+        version_key = build_version_sort_key(tag_name)
+        if version_key is None or version_key >= head_key:
+            continue
+        try:
+            asset = release_asset_from_release(release)
+        except ValueError:
+            continue
+        candidates.append((version_key, asset))
+
+    if not candidates:
+        raise ValueError(f"No published dictionary release exists before {head_version}.")
+    return max(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def build_version_sort_key(version: str) -> tuple[int, int, int, int] | None:
+    match = BUILD_VERSION_PATTERN.fullmatch(version.strip())
+    if match is None:
+        return None
+    year, month, day = (int(part) for part in match.group("build_date").split("."))
+    sequence = int(match.group("sequence") or "0")
+    return year, month, day, sequence
 
 
 def release_asset_from_release(release: dict[str, Any]) -> ReleaseAsset:
