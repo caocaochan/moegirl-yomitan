@@ -1064,14 +1064,20 @@ def test_fetch_sitemaps_in_parallel_closes_worker_sessions(monkeypatch) -> None:
     assert created_sessions[0].close_calls == 1
 
 
-def test_fetch_pages_throttles_manifest_checkpoints(tmp_path: Path, monkeypatch) -> None:
+def test_fetch_pages_uses_lightweight_periodic_checkpoints(tmp_path: Path, monkeypatch) -> None:
     settings = Settings(cache_dir=tmp_path / "cache", batch_size=1, concurrency=1)
     pages = [make_page_with_title(f"page-{index}") for index in range(101)]
     saved_progress: list[dict[str, int]] = []
+    lightweight_progress: list[dict[str, int]] = []
 
     monkeypatch.setattr(fetcher, "CHECKPOINT_INTERVAL_SECONDS", 10_000.0)
     monkeypatch.setattr(fetcher, "discover_pages", lambda settings, session, limit=None: pages)
     monkeypatch.setattr(fetcher, "save_manifest", lambda settings, pages, progress=None: saved_progress.append(progress or {}))
+    monkeypatch.setattr(
+        fetcher,
+        "save_fetch_progress",
+        lambda settings, progress, **kwargs: lightweight_progress.append(progress),
+    )
     monkeypatch.setattr(fetcher, "write_record", lambda settings, record: None)
     monkeypatch.setattr(fetcher, "log_status", lambda message: None)
 
@@ -1082,11 +1088,11 @@ def test_fetch_pages_throttles_manifest_checkpoints(tmp_path: Path, monkeypatch)
 
     fetch_pages(settings, limit=len(pages))
 
-    assert len(saved_progress) == 3
+    assert len(saved_progress) == 2
     assert saved_progress[0]["batches_completed"] == 0
-    assert saved_progress[1]["batches_completed"] == 100
-    assert saved_progress[2]["batches_completed"] == 101
-    assert saved_progress[2]["pages_pending_fetch"] == 0
+    assert saved_progress[1]["batches_completed"] == 101
+    assert saved_progress[1]["pages_pending_fetch"] == 0
+    assert [progress["batches_completed"] for progress in lightweight_progress] == [0, 100, 101]
 
 
 def test_fetch_pages_final_checkpoint_is_written(tmp_path: Path, monkeypatch) -> None:

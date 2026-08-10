@@ -82,6 +82,11 @@ def test_request_timeout_rejects_invalid_values() -> None:
         cli.main(["fetch", "--request-timeout", "-1"])
 
 
+def test_batch_size_rejects_values_above_extract_limit() -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["fetch", "--batch-size", "21"])
+
+
 def test_check_build_change_reports_changed_without_saved_state(tmp_path: Path, capsys) -> None:
     settings = write_single_page_cache(tmp_path)
 

@@ -941,7 +941,7 @@ def run_adaptive_fetch_loop(
                     queue.append(BatchTask(task.pages, task.attempt + 1, ready_at))
                     log_status(
                         "Batch request failed; scheduled retry: "
-                        f"attempt={task.attempt + 1}/{settings.batch_retry_attempts}, "
+                        f"attempt={task.attempt + 2}/{settings.batch_retry_attempts}, "
                         f"concurrency={state.current_concurrency}, "
                         f"cooldown={state.cooldown_seconds:.1f}s, "
                         f"error={format_request_error(exc)}"
