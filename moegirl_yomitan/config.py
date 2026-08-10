@@ -6,6 +6,7 @@ from typing import Union
 
 
 TimeoutType = Union[float, tuple[float, float]]
+MAX_EXTRACT_BATCH_SIZE = 20
 
 
 @dataclass(frozen=True)
@@ -25,7 +26,7 @@ class Settings:
     )
     summary_char_limit: int = 240
     batch_size: int = 20
-    concurrency: int = 2
+    concurrency: int = 4
     min_concurrency: int = 1
     sitemap_concurrency: int = 4
     chunk_size: int = 10_000
@@ -51,6 +52,14 @@ class Settings:
     @property
     def record_cache_index_path(self) -> Path:
         return self.cache_dir / "record-cache-index.json"
+
+    @property
+    def negative_cache_path(self) -> Path:
+        return self.cache_dir / "negative-cache.json"
+
+    @property
+    def fetch_progress_path(self) -> Path:
+        return self.cache_dir / "fetch-progress.json"
 
     @property
     def records_dir(self) -> Path:

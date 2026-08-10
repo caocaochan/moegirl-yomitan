@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 import sys
 
-from .config import Settings
+from .config import MAX_EXTRACT_BATCH_SIZE, Settings
 from .fetcher import fetch_pages
 from .packaging import build_dictionary_content_fingerprint, load_last_build_fingerprint, package_dictionary, save_build_state
 from .release_diff import build_release_diff_html
@@ -21,6 +21,16 @@ def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def extract_batch_size(value: str) -> int:
+    parsed = positive_int(value)
+    if parsed > MAX_EXTRACT_BATCH_SIZE:
+        raise argparse.ArgumentTypeError(
+            f"must be at most {MAX_EXTRACT_BATCH_SIZE}; the extracts API returns no more than "
+            f"{MAX_EXTRACT_BATCH_SIZE} extracts per request"
+        )
     return parsed
 
 
@@ -56,7 +66,7 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", type=Path, default=Settings.output_zip)
     parser.add_argument("--limit", type=int, default=None, help="Limit the number of discovered pages for smaller runs.")
     parser.add_argument("--summary-char-limit", type=int, default=Settings.summary_char_limit)
-    parser.add_argument("--batch-size", type=int, default=Settings.batch_size)
+    parser.add_argument("--batch-size", type=extract_batch_size, default=Settings.batch_size)
     parser.add_argument("--concurrency", type=int, default=Settings.concurrency)
     parser.add_argument("--sitemap-concurrency", type=int, default=Settings.sitemap_concurrency)
     parser.add_argument("--chunk-size", type=int, default=Settings.chunk_size)

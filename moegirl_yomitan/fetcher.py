@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -16,7 +16,7 @@ from uuid import uuid4
 
 import requests
 
-from .config import Settings
+from .config import MAX_EXTRACT_BATCH_SIZE, Settings
 from .models import SUMMARY_RECORD_SCHEMA_VERSION, ListedLink, ManifestPage, SummaryRecord
 from .sitemaps import (
     canonical_article_url,
@@ -37,6 +37,7 @@ ATOMIC_WRITE_RETRY_SECONDS = 0.05
 SESSION_POOL_BATCH = "batch"
 SESSION_POOL_SITEMAP = "sitemap"
 RECORD_CACHE_INDEX_SCHEMA_VERSION = 2
+NEGATIVE_CACHE_SCHEMA_VERSION = 1
 
 _THREAD_LOCAL = threading.local()
 _ACTIVE_SESSION_REGISTRIES: dict[str, list["SessionRegistry"]] = {
@@ -44,6 +45,8 @@ _ACTIVE_SESSION_REGISTRIES: dict[str, list["SessionRegistry"]] = {
     SESSION_POOL_SITEMAP: [],
 }
 _ACTIVE_SESSION_REGISTRIES_LOCK = threading.Lock()
+_REQUEST_METRICS_LOCK = threading.Lock()
+_REQUEST_RETRY_COUNT = 0
 
 
 def build_session(settings: Settings) -> requests.Session:
@@ -56,6 +59,7 @@ def build_session(settings: Settings) -> requests.Session:
 class BatchTask:
     pages: list[ManifestPage]
     attempt: int = 0
+    ready_at: float = 0.0
 
 
 @dataclass
@@ -125,6 +129,35 @@ class CachedRecord:
         }
 
 
+@dataclass(frozen=True)
+class NegativeCacheEntry:
+    lastmod: str
+    record_schema_version: int
+    reason: str = "missing-or-empty"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "NegativeCacheEntry" | None:
+        lastmod = data.get("lastmod")
+        record_schema_version = data.get("record_schema_version")
+        reason = data.get("reason", "missing-or-empty")
+        if not isinstance(lastmod, str) or not isinstance(record_schema_version, int) or not isinstance(reason, str):
+            return None
+        return cls(lastmod=lastmod, record_schema_version=record_schema_version, reason=reason)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "lastmod": self.lastmod,
+            "record_schema_version": self.record_schema_version,
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class NegativeCacheIndex:
+    by_source_url: dict[str, NegativeCacheEntry] = field(default_factory=dict)
+    dirty: bool = False
+
+
 @dataclass
 class RecordCacheIndex:
     by_source_url: dict[str, CachedRecord]
@@ -145,6 +178,11 @@ class FetchProgressState:
     batches_since_checkpoint: int = 0
     records_fetched: int = 0
     new_pageids_seen: set[int] = field(default_factory=set)
+    initial_pending_pages: int = 0
+    current_concurrency: int = 1
+    failed_batch_attempts: int = 0
+    request_retry_baseline: int = 0
+    recent_batch_seconds: deque[float] = field(default_factory=lambda: deque(maxlen=100))
 
 
 @dataclass
@@ -173,6 +211,17 @@ class SessionRegistry:
 
 def log_status(message: str) -> None:
     print(message, flush=True)
+
+
+def request_retry_count() -> int:
+    with _REQUEST_METRICS_LOCK:
+        return _REQUEST_RETRY_COUNT
+
+
+def record_request_retry() -> None:
+    global _REQUEST_RETRY_COUNT
+    with _REQUEST_METRICS_LOCK:
+        _REQUEST_RETRY_COUNT += 1
 
 
 class FirstListItemTitleParser(HTMLParser):
@@ -501,6 +550,67 @@ def save_record_cache_index(settings: Settings, record_index: RecordCacheIndex) 
     )
 
 
+def load_negative_cache(settings: Settings) -> NegativeCacheIndex:
+    if not settings.negative_cache_path.exists():
+        return NegativeCacheIndex()
+    try:
+        data = json.loads(settings.negative_cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return NegativeCacheIndex()
+    if not isinstance(data, dict) or data.get("schema_version") != NEGATIVE_CACHE_SCHEMA_VERSION:
+        return NegativeCacheIndex()
+
+    raw_entries = data.get("entries")
+    if not isinstance(raw_entries, dict):
+        return NegativeCacheIndex()
+    entries: dict[str, NegativeCacheEntry] = {}
+    for source_url, raw_entry in raw_entries.items():
+        if not isinstance(source_url, str) or not isinstance(raw_entry, dict):
+            continue
+        entry = NegativeCacheEntry.from_dict(raw_entry)
+        if entry is not None:
+            entries[source_url] = entry
+    return NegativeCacheIndex(entries)
+
+
+def save_negative_cache(settings: Settings, negative_index: NegativeCacheIndex, *, force: bool = False) -> None:
+    if not force and not negative_index.dirty:
+        return
+    settings.cache_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(
+        settings.negative_cache_path,
+        json.dumps(
+            {
+                "schema_version": NEGATIVE_CACHE_SCHEMA_VERSION,
+                "entries": {
+                    source_url: entry.to_dict()
+                    for source_url, entry in sorted(negative_index.by_source_url.items())
+                },
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
+    negative_index.dirty = False
+
+
+def mark_negative_cache_entry(negative_index: NegativeCacheIndex, page: ManifestPage) -> None:
+    entry = NegativeCacheEntry(
+        lastmod=page.lastmod,
+        record_schema_version=SUMMARY_RECORD_SCHEMA_VERSION,
+    )
+    if negative_index.by_source_url.get(page.source_url) == entry:
+        return
+    negative_index.by_source_url[page.source_url] = entry
+    negative_index.dirty = True
+
+
+def clear_negative_cache_entry(negative_index: NegativeCacheIndex, source_url: str) -> None:
+    if negative_index.by_source_url.pop(source_url, None) is not None:
+        negative_index.dirty = True
+
+
 def add_record_to_cache_index(settings: Settings, record_index: RecordCacheIndex, record: SummaryRecord) -> bool:
     record_path = record_path_for_page(settings, record.pageid)
     try:
@@ -668,9 +778,17 @@ def hydrate_pages_from_record_cache(
     return hydrated
 
 
-def page_needs_fetch(page: ManifestPage, record: CachedRecord | None) -> bool:
+def page_needs_fetch(
+    page: ManifestPage,
+    record: CachedRecord | None,
+    negative_entry: NegativeCacheEntry | None = None,
+) -> bool:
     if record is None:
-        return True
+        return not (
+            negative_entry is not None
+            and negative_entry.record_schema_version == SUMMARY_RECORD_SCHEMA_VERSION
+            and negative_entry.lastmod == page.lastmod
+        )
     if record.record_schema_version != SUMMARY_RECORD_SCHEMA_VERSION:
         return True
     if record.lastmod != page.lastmod:
@@ -697,6 +815,12 @@ def build_progress(
 
 
 def fetch_pages(settings: Settings, limit: int | None = None) -> list[ManifestPage]:
+    if not 1 <= settings.batch_size <= MAX_EXTRACT_BATCH_SIZE:
+        raise ValueError(
+            f"batch_size must be between 1 and {MAX_EXTRACT_BATCH_SIZE}; the extracts API returns no more than "
+            f"{MAX_EXTRACT_BATCH_SIZE} extracts per request"
+        )
+
     session = build_session(settings)
     try:
         log_status("Discovering sitemap pages...")
@@ -714,11 +838,22 @@ def fetch_pages(settings: Settings, limit: int | None = None) -> list[ManifestPa
         record_index = build_record_cache_index(settings)
     log_status(f"Loaded {record_index.count} cached records in {time.monotonic() - index_started_at:.1f}s.")
 
+    negative_index = load_negative_cache(settings)
+    log_status(f"Loaded {len(negative_index.by_source_url)} cached missing/empty outcomes.")
     hydrated_from_records = hydrate_pages_from_record_cache(settings, pages, record_index)
-    pending = [page for page in pages if page_needs_fetch(page, record_for_page(page, record_index))]
+    pending = [
+        page
+        for page in pages
+        if page_needs_fetch(
+            page,
+            record_for_page(page, record_index),
+            negative_index.by_source_url.get(page.source_url),
+        )
+    ]
 
     if not pending:
         save_manifest(settings, pages, progress=build_progress(record_index.count, hydrated_from_records, 0))
+        save_negative_cache(settings, negative_index)
         log_status("No pending pages to fetch.")
         return pages
 
@@ -731,6 +866,9 @@ def fetch_pages(settings: Settings, limit: int | None = None) -> list[ManifestPa
         pending_pages_remaining=len(pending),
         fetch_started_at=fetch_started_at,
         last_checkpoint_at=fetch_started_at,
+        initial_pending_pages=len(pending),
+        current_concurrency=max(1, settings.concurrency),
+        request_retry_baseline=request_retry_count(),
     )
 
     log_status(
@@ -739,13 +877,14 @@ def fetch_pages(settings: Settings, limit: int | None = None) -> list[ManifestPa
         f"{len(batches)} batches, "
         f"concurrency={settings.concurrency}, "
         f"batch_retries={settings.batch_retry_attempts}, "
-        f"checkpoint_every={CHECKPOINT_BATCH_INTERVAL} batches or {CHECKPOINT_INTERVAL_SECONDS:.0f}s."
+        f"progress_every={CHECKPOINT_BATCH_INTERVAL} batches or {CHECKPOINT_INTERVAL_SECONDS:.0f}s; "
+        "full_manifest=start/end."
     )
-    save_manifest_checkpoint(settings, pages, progress_state, force=True)
-    run_adaptive_fetch_loop(settings, pages, batches, progress_state, record_index)
+    save_manifest_checkpoint(settings, pages, progress_state, negative_index=negative_index, force=True)
+    run_adaptive_fetch_loop(settings, pages, batches, progress_state, record_index, negative_index)
     if limit is None:
         save_record_cache_index(settings, record_index)
-    save_manifest_checkpoint(settings, pages, progress_state, force=True)
+    save_manifest_checkpoint(settings, pages, progress_state, negative_index=negative_index, force=True)
     return pages
 
 
@@ -755,39 +894,65 @@ def run_adaptive_fetch_loop(
     batches: list[list[ManifestPage]],
     progress_state: FetchProgressState,
     record_index: RecordCacheIndex,
+    negative_index: NegativeCacheIndex | None = None,
 ) -> None:
+    if negative_index is None:
+        negative_index = NegativeCacheIndex()
     queue: deque[BatchTask] = deque(BatchTask(batch) for batch in batches)
     max_workers = max(1, settings.concurrency)
     state = AdaptiveState(current_concurrency=max_workers)
-    in_flight: dict[object, BatchTask] = {}
+    progress_state.current_concurrency = state.current_concurrency
+    in_flight: dict[object, tuple[BatchTask, float]] = {}
 
     with session_registry_scope(SESSION_POOL_BATCH):
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             while queue or in_flight:
                 while queue and len(in_flight) < state.current_concurrency:
-                    task = queue.popleft()
+                    task = pop_ready_batch(queue, time.monotonic())
+                    if task is None:
+                        break
+                    submitted_at = time.monotonic()
                     future = executor.submit(fetch_batch, settings, task.pages)
-                    in_flight[future] = task
+                    in_flight[future] = (task, submitted_at)
 
                 if not in_flight:
+                    if queue:
+                        time.sleep(max(0.0, min(task.ready_at for task in queue) - time.monotonic()))
                     continue
 
-                future = next(as_completed(list(in_flight.keys()), timeout=None))
-                task = in_flight.pop(future)
+                wait_timeout = None
+                if queue and len(in_flight) < state.current_concurrency:
+                    wait_timeout = max(0.0, min(task.ready_at for task in queue) - time.monotonic())
+                completed, _ = wait(in_flight, timeout=wait_timeout, return_when=FIRST_COMPLETED)
+                if not completed:
+                    continue
+                future = next(iter(completed))
+                task, submitted_at = in_flight.pop(future)
+                batch_elapsed = time.monotonic() - submitted_at
                 try:
                     records = future.result()
-                except requests.RequestException:
+                except requests.RequestException as exc:
                     state = adaptive_state_after_failure(settings, state)
+                    progress_state.current_concurrency = state.current_concurrency
+                    progress_state.failed_batch_attempts += 1
                     if task.attempt + 1 >= settings.batch_retry_attempts:
                         raise
-                    if state.cooldown_seconds > 0:
-                        time.sleep(state.cooldown_seconds)
-                    queue.appendleft(BatchTask(task.pages, task.attempt + 1))
+                    ready_at = time.monotonic() + state.cooldown_seconds
+                    queue.append(BatchTask(task.pages, task.attempt + 1, ready_at))
+                    log_status(
+                        "Batch request failed; scheduled retry: "
+                        f"attempt={task.attempt + 1}/{settings.batch_retry_attempts}, "
+                        f"concurrency={state.current_concurrency}, "
+                        f"cooldown={state.cooldown_seconds:.1f}s, "
+                        f"error={format_request_error(exc)}"
+                    )
                     continue
 
                 for page, record in zip(task.pages, records):
                     if record is None:
+                        mark_negative_cache_entry(negative_index, page)
                         continue
+                    clear_negative_cache_entry(negative_index, page.source_url)
                     is_new_pageid = record.pageid not in record_index.by_pageid
                     write_record(settings, record)
                     add_record_to_cache_index(settings, record_index, record)
@@ -801,9 +966,25 @@ def run_adaptive_fetch_loop(
 
                 progress_state.successful_batches += 1
                 progress_state.batches_since_checkpoint += 1
+                progress_state.recent_batch_seconds.append(batch_elapsed)
                 progress_state.pending_pages_remaining = max(0, progress_state.pending_pages_remaining - len(task.pages))
-                save_manifest_checkpoint(settings, all_pages, progress_state)
                 state = adaptive_state_after_success(settings, state)
+                progress_state.current_concurrency = state.current_concurrency
+                save_manifest_checkpoint(
+                    settings,
+                    all_pages,
+                    progress_state,
+                    negative_index=negative_index,
+                )
+
+
+def pop_ready_batch(queue: deque[BatchTask], now: float) -> BatchTask | None:
+    for _ in range(len(queue)):
+        task = queue.popleft()
+        if task.ready_at <= now:
+            return task
+        queue.append(task)
+    return None
 
 
 def save_manifest_checkpoint(
@@ -811,39 +992,97 @@ def save_manifest_checkpoint(
     pages: list[ManifestPage],
     progress_state: FetchProgressState,
     *,
+    negative_index: NegativeCacheIndex | None = None,
     force: bool = False,
 ) -> None:
     now = time.monotonic()
     if not force and not should_checkpoint(progress_state, now):
         return
 
-    elapsed = now - progress_state.fetch_started_at
+    progress = build_progress(
+        progress_state.cached_records_seen + len(progress_state.new_pageids_seen),
+        progress_state.pages_hydrated_from_records,
+        progress_state.pending_pages_remaining,
+        batches_completed=progress_state.successful_batches,
+        records_fetched=progress_state.records_fetched,
+    )
+    elapsed = max(0.0, now - progress_state.fetch_started_at)
+    processed_pages = max(0, progress_state.initial_pending_pages - progress_state.pending_pages_remaining)
+    pages_per_second = processed_pages / elapsed if elapsed > 0 else 0.0
+    eta_seconds = progress_state.pending_pages_remaining / pages_per_second if pages_per_second > 0 else None
+    sorted_batch_seconds = sorted(progress_state.recent_batch_seconds)
+    batch_p50 = sorted_batch_seconds[len(sorted_batch_seconds) // 2] if sorted_batch_seconds else None
+    retry_count = max(0, request_retry_count() - progress_state.request_retry_baseline)
+    batch_p50_text = f"{batch_p50:.2f}s" if batch_p50 is not None else "n/a"
     log_status(
         "Fetch progress: "
         f"batches={progress_state.successful_batches}, "
         f"records={progress_state.records_fetched}, "
         f"pending={progress_state.pending_pages_remaining}, "
+        f"concurrency={progress_state.current_concurrency}, "
+        f"rate={pages_per_second:.1f} pages/s, "
+        f"batch_p50={batch_p50_text}, "
+        f"retries={retry_count}, "
+        f"batch_failures={progress_state.failed_batch_attempts}, "
+        f"eta={format_duration(eta_seconds)}, "
         f"elapsed={elapsed:.1f}s"
     )
-    log_status("Saving manifest checkpoint...")
-    save_started_at = time.monotonic()
-    save_manifest(
+    save_fetch_progress(
         settings,
-        pages,
-        progress=build_progress(
-            progress_state.cached_records_seen + len(progress_state.new_pageids_seen),
-            progress_state.pages_hydrated_from_records,
-            progress_state.pending_pages_remaining,
-            batches_completed=progress_state.successful_batches,
-            records_fetched=progress_state.records_fetched,
+        progress,
+        current_concurrency=progress_state.current_concurrency,
+        request_retries=retry_count,
+        failed_batch_attempts=progress_state.failed_batch_attempts,
+    )
+    if negative_index is not None:
+        save_negative_cache(settings, negative_index)
+    if force:
+        log_status("Saving manifest checkpoint...")
+        save_started_at = time.monotonic()
+        save_manifest(settings, pages, progress=progress)
+        save_elapsed = time.monotonic() - save_started_at
+        if save_elapsed > SLOW_CHECKPOINT_SECONDS:
+            log_status(f"Saved manifest checkpoint in {save_elapsed:.1f}s.")
+    progress_state.last_checkpoint_at = time.monotonic()
+    progress_state.batches_since_checkpoint = 0
+
+
+def save_fetch_progress(
+    settings: Settings,
+    progress: dict[str, int],
+    *,
+    current_concurrency: int,
+    request_retries: int,
+    failed_batch_attempts: int,
+) -> None:
+    settings.cache_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(
+        settings.fetch_progress_path,
+        json.dumps(
+            {
+                "generated_at": utc_now_iso(),
+                "progress": progress,
+                "current_concurrency": current_concurrency,
+                "request_retries": request_retries,
+                "failed_batch_attempts": failed_batch_attempts,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
         ),
     )
-    checkpoint_finished_at = time.monotonic()
-    save_elapsed = checkpoint_finished_at - save_started_at
-    if save_elapsed > SLOW_CHECKPOINT_SECONDS:
-        log_status(f"Saved manifest checkpoint in {save_elapsed:.1f}s.")
-    progress_state.last_checkpoint_at = checkpoint_finished_at
-    progress_state.batches_since_checkpoint = 0
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "n/a"
+    rounded = max(0, int(seconds + 0.5))
+    hours, remainder = divmod(rounded, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
 
 
 def should_checkpoint(progress_state: FetchProgressState, now: float) -> bool:
@@ -864,8 +1103,12 @@ def fetch_batch_with_session(
     batch: list[ManifestPage],
 ) -> list[SummaryRecord | None]:
     titles = [page.title_from_url for page in batch]
+    pageids = [page.pageid for page in batch if page.pageid is not None]
     try:
-        payload = fetch_extract_payload(session, settings, titles)
+        if batch and len(pageids) == len(batch):
+            payload = fetch_extract_payload(session, settings, [], pageids=pageids)
+        else:
+            payload = fetch_extract_payload(session, settings, titles)
     except requests.HTTPError as exc:
         if not is_request_too_large_error(exc) or len(batch) <= 1:
             raise
@@ -879,18 +1122,23 @@ def fetch_batch_with_session(
     normalized_map = {item["from"]: item["to"] for item in query.get("normalized", [])}
     redirect_map = {item["from"]: item["to"] for item in query.get("redirects", [])}
     pages_by_title = {}
+    pages_by_pageid: dict[int, dict[str, Any]] = {}
     for value in query.get("pages", {}).values():
         if "missing" in value:
             continue
         pages_by_title[value["title"]] = value
+        if "pageid" in value:
+            pages_by_pageid[int(value["pageid"])] = value
 
     records: list[SummaryRecord | None] = []
     for requested_page in batch:
-        resolved_title = normalized_map.get(requested_page.title_from_url, requested_page.title_from_url)
-        resolved_title = redirect_map.get(resolved_title, resolved_title)
-        payload_page = pages_by_title.get(resolved_title)
+        payload_page = pages_by_pageid.get(requested_page.pageid) if requested_page.pageid is not None else None
         if payload_page is None:
-            payload_page = pages_by_title.get(requested_page.title_from_url)
+            resolved_title = normalized_map.get(requested_page.title_from_url, requested_page.title_from_url)
+            resolved_title = redirect_map.get(resolved_title, resolved_title)
+            payload_page = pages_by_title.get(resolved_title)
+            if payload_page is None:
+                payload_page = pages_by_title.get(requested_page.canonical_title or requested_page.title_from_url)
         if payload_page is None:
             records.append(None)
             continue
@@ -954,7 +1202,18 @@ def fetch_sitemap_worker(settings: Settings, url: str) -> str:
     return fetch_sitemap_text_with_fallback(session, url, settings)
 
 
-def fetch_extract_payload(session: requests.Session, settings: Settings, titles: list[str]) -> dict:
+def fetch_extract_payload(
+    session: requests.Session,
+    settings: Settings,
+    titles: list[str],
+    *,
+    pageids: list[int] | None = None,
+) -> dict:
+    if pageids is not None and titles:
+        raise ValueError("Specify titles or pageids, not both")
+    requested_count = len(pageids) if pageids is not None else len(titles)
+    if not 1 <= requested_count <= MAX_EXTRACT_BATCH_SIZE:
+        raise ValueError(f"Extract requests must contain between 1 and {MAX_EXTRACT_BATCH_SIZE} pages")
     payload = {
         "action": "query",
         "prop": "extracts",
@@ -962,8 +1221,11 @@ def fetch_extract_payload(session: requests.Session, settings: Settings, titles:
         "explaintext": "1",
         "redirects": "1",
         "format": "json",
-        "titles": "|".join(titles),
     }
+    if pageids is not None:
+        payload["pageids"] = "|".join(str(pageid) for pageid in pageids)
+    else:
+        payload["titles"] = "|".join(titles)
     last_error: requests.RequestException | None = None
     for url in host_fallback_candidates(settings.extracts_api_url):
         try:
@@ -1280,6 +1542,7 @@ def request_with_retry(
         except requests.RequestException:
             if attempt == settings.retry_attempts - 1:
                 raise
+        record_request_retry()
         sleep_seconds = settings.backoff_base_seconds * (2**attempt)
         time.sleep(sleep_seconds)
     raise RuntimeError(f"Failed to fetch {url}")
