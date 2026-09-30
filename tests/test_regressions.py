@@ -1,3 +1,4 @@
+from moegirl_yomitan import scheduler
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
@@ -87,10 +88,10 @@ def test_one_character_summary_limit():
     {"query": {"pages": {}}},
 ])
 def test_failed_api_outcomes_never_enter_negative_cache(tmp_path, monkeypatch, payload):
-    settings = Settings(cache_dir=tmp_path / "cache", batch_retry_attempts=1, concurrency=1)
+    settings = Settings(cache_dir=tmp_path / "cache", retry_attempts=1, concurrency=1)
     page = ManifestPage("https://mzh.moegirl.org.cn/Main", "Main", "today", "map")
     monkeypatch.setattr(fetcher, "discover_pages", lambda *a, **k: [page])
-    monkeypatch.setattr(fetcher, "fetch_extract_payload", lambda *a, **k: payload)
+    monkeypatch.setattr(scheduler, "api_attempt", lambda settings, url, payload: (lambda *a, **k: payload)(None, settings, []))
     with pytest.raises(fetcher.ApiResponseError):
         fetcher.fetch_pages(settings)
     assert fetcher.load_negative_cache(settings).by_source_url == {}
@@ -105,7 +106,7 @@ def test_confirmed_missing_and_empty_outcomes_are_cached(tmp_path, monkeypatch, 
     settings = Settings(cache_dir=tmp_path / "cache", concurrency=1)
     page = ManifestPage("https://mzh.moegirl.org.cn/Main", "Main", "today", "map")
     monkeypatch.setattr(fetcher, "discover_pages", lambda *a, **k: [page])
-    monkeypatch.setattr(fetcher, "fetch_extract_payload", lambda *a, **k: {"query": {"pages": {"1": page_payload}}})
+    monkeypatch.setattr(scheduler, "api_attempt", lambda settings, url, payload: (lambda *a, **k: {"query": {"pages": {"1": page_payload}}})(None, settings, []))
     fetcher.fetch_pages(settings)
     negative = fetcher.load_negative_cache(settings).by_source_url[page.source_url]
     assert not fetcher.page_needs_fetch(page, None, negative)
@@ -154,11 +155,19 @@ def test_repeated_extract_continuation_fails(monkeypatch):
 
 def test_non_json_api_response_fails(monkeypatch):
     class Response:
+        status_code = 200
+        headers = {}
+        def raise_for_status(self):
+            pass
+        def close(self):
+            pass
         def json(self):
             raise ValueError("HTML challenge")
-    monkeypatch.setattr(fetcher, "request_with_retry", lambda *a, **k: Response())
+    class Session:
+        def request(self, *a, **k):
+            return Response()
     with pytest.raises(fetcher.ApiResponseError, match="valid JSON"):
-        fetcher.fetch_extract_payload(object(), Settings(), ["One"])
+        fetcher.fetch_extract_payload(Session(), Settings(retry_attempts=1), ["One"])
 
 
 def test_packaging_failure_preserves_existing_assets(tmp_path, monkeypatch):
@@ -259,7 +268,7 @@ def test_fetch_records_summary_limit_and_completeness(monkeypatch):
     assert len(record.summary) == 3
 
 
-def test_aliases_remain_fresh_on_second_fetch(tmp_path, monkeypatch):
+def test_aliases_remain_fresh_on_second_fetch(tmp_path, monkeypatch, mock_batches):
     settings = Settings(cache_dir=tmp_path / "cache", concurrency=1)
     calls = []
     def discover(*args, **kwargs):
@@ -271,7 +280,7 @@ def test_aliases_remain_fresh_on_second_fetch(tmp_path, monkeypatch):
         calls.append([p.title_from_url for p in pages])
         return [SummaryRecord(1, "Main", p.source_url, p.source_url, p.lastmod, "summary", "today") for p in pages]
     monkeypatch.setattr(fetcher, "discover_pages", discover)
-    monkeypatch.setattr(fetcher, "fetch_batch", batch)
+    mock_batches(batch)
     fetcher.fetch_pages(settings)
     pages = fetcher.fetch_pages(settings)
     assert len(calls) == 1
@@ -331,9 +340,9 @@ def test_confirmed_empty_outcome_excludes_previous_record(tmp_path, monkeypatch)
     page = fetcher.load_manifest(settings)[0]
     page.lastmod = "changed"
     monkeypatch.setattr(fetcher, "discover_pages", lambda *a, **k: [page])
-    monkeypatch.setattr(fetcher, "fetch_extract_payload", lambda *a, **k: {
+    monkeypatch.setattr(scheduler, "api_attempt", lambda settings, url, payload: (lambda *a, **k: {
         "query": {"pages": {"1": {"pageid": 1, "title": "Main", "extract": ""}}},
-    })
+    })(None, settings, []))
     fetcher.fetch_pages(settings)
     index = fetcher.build_record_cache_index(settings)
     negative = fetcher.load_negative_cache(settings).by_source_url[page.source_url]
@@ -375,7 +384,7 @@ def test_legacy_records_keep_default_cache_compatibility(tmp_path):
 
 
 @pytest.mark.parametrize("contents", ["{truncated", "[]", '{"pageid": "bad"}', '{"pageid": 1}'])
-def test_bad_record_is_refetched_but_blocks_packaging(tmp_path, monkeypatch, contents):
+def test_bad_record_is_refetched_but_blocks_packaging(tmp_path, monkeypatch, contents, mock_batches):
     settings = cache_fixture(tmp_path)
     path = fetcher.record_path_for_page(settings, 1)
     path.write_text(contents, encoding="utf-8")
@@ -383,7 +392,7 @@ def test_bad_record_is_refetched_but_blocks_packaging(tmp_path, monkeypatch, con
         packaging.package_dictionary(settings)
     assert not settings.output_zip.exists()
     monkeypatch.setattr(fetcher, "discover_pages", lambda *a, **k: fetcher.load_manifest(settings))
-    monkeypatch.setattr(fetcher, "fetch_batch", lambda s, pages: [
+    mock_batches(lambda s, pages: [
         SummaryRecord(1, "Main", p.source_url, p.source_url, p.lastmod, "repaired", "today") for p in pages
     ])
     fetcher.fetch_pages(settings)

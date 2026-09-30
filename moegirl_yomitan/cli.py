@@ -69,10 +69,12 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--limit", type=positive_int, default=None, help="Limit discovery; replaces the cache manifest with this subset.")
     parser.add_argument("--summary-char-limit", type=positive_int, default=Settings.summary_char_limit)
     parser.add_argument("--batch-size", type=extract_batch_size, default=Settings.batch_size)
-    parser.add_argument("--concurrency", type=positive_int, default=Settings.concurrency)
+    parser.add_argument("--concurrency", type=positive_int, default=Settings.concurrency,
+                        help="Maximum concurrent entry API requests, including link lookups; tuned automatically.")
     parser.add_argument("--sitemap-concurrency", type=positive_int, default=Settings.sitemap_concurrency)
     parser.add_argument("--chunk-size", type=positive_int, default=Settings.chunk_size)
-    parser.add_argument("--retry-attempts", type=positive_int, default=Settings.retry_attempts)
+    parser.add_argument("--retry-attempts", type=positive_int, default=Settings.retry_attempts,
+                        help="Total attempts per entry API step, including its first request and host fallback.")
     parser.add_argument("--request-timeout", type=positive_float, default=Settings.request_timeout[1])
     parser.add_argument("--backoff-base-seconds", type=positive_float, default=Settings.backoff_base_seconds)
 

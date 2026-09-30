@@ -22,10 +22,53 @@ python -m moegirl_yomitan package --output dist/moegirl-yomitan.zip
 ```
 
 `--batch-size` controls how many page titles are packed into each extracts API request.
-`--concurrency` controls how many batches run in parallel. If the remote wiki starts
+`--concurrency` is the ceiling for all simultaneous entry API requests, including
+listed-link lookups. Fetching starts at up to four workers (default ceiling: four)
+and tunes concurrency automatically using throughput and request latency. If the remote wiki starts
 rejecting long requests, lower `--batch-size` first.
 `build --from-cache` rebuilds the Yomitan archive from the current local cache only and
 does not download or refresh entries.
+
+Entry downloads use resumable extract and listed-link steps. Ordinary summaries
+are saved immediately; disambiguation records are saved only after their complete
+HTML/link lookup succeeds. Link requests share the entry concurrency ceiling and
+have a bounded queue. Full HTML and link continuation behavior is preserved,
+including lists below headings.
+
+`--retry-attempts` is the total attempt budget **per entry API step**, including the
+first request and host fallback. For example, `--retry-attempts 8` permits at most
+eight attempts for a failed extract or link continuation; completed steps are not
+replayed. Backoff releases worker slots, uses jitter, and is capped at 30 seconds
+unless `Retry-After` requires longer. HTTP 429 and MediaWiki `maxlag` pause entry
+requests across both wiki host aliases. Sitemap downloads retain their previous
+transport/retry behavior. The Python `Settings.batch_retry_attempts` constructor
+field is deprecated and no longer affects entry fetching.
+
+Automatic tuning halves concurrency on throttling and lowers it by one on other
+transient failures. Throughput probes require two healthy 30-second windows with
+at least ten successful extract requests each; a higher level is retained only
+when it improves throughput by at least 10% without excessive retries or latency.
+Unsuccessful probes revert and are suppressed for five minutes. Progress reports
+include stage queues, active requests, delayed retries, shared cooldown, request
+p50/p95, extract throughput, and finalized-entry throughput. Server caching can
+strongly affect timings; increasing the ceiling does not guarantee a speedup.
+
+On an exhausted or permanent failure, fetching stops new submissions, drains
+running attempts, and checkpoints complete entries before returning an error.
+Incomplete step state is memory-only and is fetched again after restarting.
+
+A bounded live comparison of fixed four workers and adaptive ceilings of four and
+eight is available with:
+
+```bash
+python scripts/benchmark_downloads.py --pages-per-case 1200 --max-seconds-per-case 120
+```
+
+It samples distinct batches balanced by cached summary length and disambiguation
+prevalence, reports repeated server-cached batches separately, and writes only to
+a separate `.cache/download-benchmark` directory. Increase the sample and time
+limits to observe the two-minute probe evaluation; short cases may finish with
+the eight-worker ceiling still operating at four workers.
 
 `--limit` replaces the selected cache's manifest with the discovered subset. Use a
 separate `--cache-dir` and an output in a separate directory for sample runs; the

@@ -7,7 +7,7 @@ import pytest
 import requests
 
 from moegirl_yomitan.config import Settings
-from moegirl_yomitan.fetcher import AdaptiveState, adaptive_state_after_failure, adaptive_state_after_success, fetch_pages
+from moegirl_yomitan.fetcher import fetch_pages
 from moegirl_yomitan.models import ListedLink, ManifestPage, SummaryRecord
 from moegirl_yomitan.packaging import (
     alias_term_for_title,
@@ -227,28 +227,6 @@ def test_load_git_build_versions_accepts_plain_and_prefixed_tags(monkeypatch) ->
     monkeypatch.setattr("moegirl_yomitan.versioning.subprocess.run", lambda *args, **kwargs: Result())
 
     assert load_git_build_versions() == ["2026.04.29", "2026.04.29.1"]
-
-
-def test_adaptive_state_reduces_concurrency_and_adds_cooldown_on_failure() -> None:
-    settings = Settings(concurrency=4, min_concurrency=1, backoff_base_seconds=1.0, adaptive_backoff_cap_seconds=30.0)
-    state = AdaptiveState(current_concurrency=4, consecutive_successes=1, cooldown_seconds=0.0)
-    next_state = adaptive_state_after_failure(settings, state)
-    assert next_state.current_concurrency == 3
-    assert next_state.consecutive_successes == 0
-    assert next_state.cooldown_seconds == 1.0
-
-
-def test_adaptive_state_recovers_concurrency_after_successes() -> None:
-    settings = Settings(concurrency=4, min_concurrency=1, backoff_base_seconds=1.0, adaptive_backoff_cap_seconds=30.0)
-    state = AdaptiveState(current_concurrency=2, consecutive_successes=0, cooldown_seconds=2.0)
-    state = adaptive_state_after_success(settings, state)
-    assert state.current_concurrency == 2
-    assert state.consecutive_successes == 1
-    assert state.cooldown_seconds == 1.0
-    state = adaptive_state_after_success(settings, state)
-    assert state.current_concurrency == 3
-    assert state.consecutive_successes == 0
-    assert state.cooldown_seconds == 0.0
 
 
 def test_smoke_build_and_package(tmp_path: Path) -> None:

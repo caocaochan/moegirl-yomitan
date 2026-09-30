@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -58,20 +58,6 @@ def build_session(settings: Settings) -> requests.Session:
     session = requests.Session()
     session.headers["User-Agent"] = settings.user_agent
     return session
-
-
-@dataclass
-class BatchTask:
-    pages: list[ManifestPage]
-    attempt: int = 0
-    ready_at: float = 0.0
-
-
-@dataclass
-class AdaptiveState:
-    current_concurrency: int
-    consecutive_successes: int = 0
-    cooldown_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -198,6 +184,7 @@ class FetchProgressState:
     failed_batch_attempts: int = 0
     request_retry_baseline: int = 0
     recent_batch_seconds: deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    scheduler_metrics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -909,7 +896,7 @@ def fetch_pages(settings: Settings, limit: int | None = None) -> list[ManifestPa
         fetch_started_at=fetch_started_at,
         last_checkpoint_at=fetch_started_at,
         initial_pending_pages=len(pending),
-        current_concurrency=max(1, settings.concurrency),
+        current_concurrency=max(settings.min_concurrency, min(4, settings.concurrency)),
         request_retry_baseline=request_retry_count(),
     )
 
@@ -917,16 +904,21 @@ def fetch_pages(settings: Settings, limit: int | None = None) -> list[ManifestPa
         "Fetching pending pages: "
         f"{len(pending)} pages, "
         f"{len(batches)} batches, "
-        f"concurrency={settings.concurrency}, "
-        f"batch_retries={settings.batch_retry_attempts}, "
+        f"concurrency_ceiling={settings.concurrency}, "
+        f"initial_concurrency={progress_state.current_concurrency}, "
+        f"request_attempts={settings.retry_attempts}, "
         f"progress_every={CHECKPOINT_BATCH_INTERVAL} batches or {CHECKPOINT_INTERVAL_SECONDS:.0f}s; "
         "full_manifest=start/end."
     )
     save_manifest_checkpoint(settings, pages, progress_state, negative_index=negative_index, force=True)
-    run_adaptive_fetch_loop(settings, pages, batches, progress_state, record_index, negative_index)
-    if limit is None:
-        save_record_cache_index(settings, record_index)
-    save_manifest_checkpoint(settings, pages, progress_state, negative_index=negative_index, force=True)
+    try:
+        run_adaptive_fetch_loop(settings, pages, batches, progress_state, record_index, negative_index)
+    finally:
+        try:
+            if limit is None:
+                save_record_cache_index(settings, record_index)
+        finally:
+            save_manifest_checkpoint(settings, pages, progress_state, negative_index=negative_index, force=True)
     return pages
 
 
@@ -938,99 +930,10 @@ def run_adaptive_fetch_loop(
     record_index: RecordCacheIndex,
     negative_index: NegativeCacheIndex | None = None,
 ) -> None:
-    if negative_index is None:
-        negative_index = NegativeCacheIndex()
-    queue: deque[BatchTask] = deque(BatchTask(batch) for batch in batches)
-    max_workers = max(1, settings.concurrency)
-    state = AdaptiveState(current_concurrency=max_workers)
-    progress_state.current_concurrency = state.current_concurrency
-    in_flight: dict[object, tuple[BatchTask, float]] = {}
+    from .scheduler import EntryScheduler
 
-    with session_registry_scope(SESSION_POOL_BATCH):
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            while queue or in_flight:
-                while queue and len(in_flight) < state.current_concurrency:
-                    task = pop_ready_batch(queue, time.monotonic())
-                    if task is None:
-                        break
-                    submitted_at = time.monotonic()
-                    future = executor.submit(fetch_batch, settings, task.pages)
-                    in_flight[future] = (task, submitted_at)
-
-                if not in_flight:
-                    if queue:
-                        time.sleep(max(0.0, min(task.ready_at for task in queue) - time.monotonic()))
-                    continue
-
-                wait_timeout = None
-                if queue and len(in_flight) < state.current_concurrency:
-                    wait_timeout = max(0.0, min(task.ready_at for task in queue) - time.monotonic())
-                completed, _ = wait(in_flight, timeout=wait_timeout, return_when=FIRST_COMPLETED)
-                if not completed:
-                    continue
-                future = next(iter(completed))
-                task, submitted_at = in_flight.pop(future)
-                batch_elapsed = time.monotonic() - submitted_at
-                try:
-                    records = future.result()
-                    if len(records) != len(task.pages):
-                        raise ApiResponseError("Batch result omitted requested pages")
-                except requests.RequestException as exc:
-                    state = adaptive_state_after_failure(settings, state)
-                    progress_state.current_concurrency = state.current_concurrency
-                    progress_state.failed_batch_attempts += 1
-                    if task.attempt + 1 >= settings.batch_retry_attempts:
-                        raise
-                    ready_at = time.monotonic() + state.cooldown_seconds
-                    queue.append(BatchTask(task.pages, task.attempt + 1, ready_at))
-                    log_status(
-                        "Batch request failed; scheduled retry: "
-                        f"attempt={task.attempt + 2}/{settings.batch_retry_attempts}, "
-                        f"concurrency={state.current_concurrency}, "
-                        f"cooldown={state.cooldown_seconds:.1f}s, "
-                        f"error={format_request_error(exc)}"
-                    )
-                    continue
-
-                for page, record in zip(task.pages, records):
-                    if record is None:
-                        mark_negative_cache_entry(negative_index, page)
-                        page.fetched_lastmod = ""
-                        continue
-                    clear_negative_cache_entry(negative_index, page.source_url)
-                    is_new_pageid = record.pageid not in record_index.by_pageid
-                    write_record(settings, record)
-                    add_record_to_cache_index(settings, record_index, record)
-                    page.pageid = record.pageid
-                    page.canonical_title = record.canonical_title
-                    page.article_url = record.article_url
-                    page.record_path = record_path_for_page(settings, record.pageid).relative_to(settings.cache_dir).as_posix()
-                    page.fetched_lastmod = page.lastmod
-                    progress_state.records_fetched += 1
-                    if is_new_pageid:
-                        progress_state.new_pageids_seen.add(record.pageid)
-
-                progress_state.successful_batches += 1
-                progress_state.batches_since_checkpoint += 1
-                progress_state.recent_batch_seconds.append(batch_elapsed)
-                progress_state.pending_pages_remaining = max(0, progress_state.pending_pages_remaining - len(task.pages))
-                state = adaptive_state_after_success(settings, state)
-                progress_state.current_concurrency = state.current_concurrency
-                save_manifest_checkpoint(
-                    settings,
-                    all_pages,
-                    progress_state,
-                    negative_index=negative_index,
-                )
-
-
-def pop_ready_batch(queue: deque[BatchTask], now: float) -> BatchTask | None:
-    for _ in range(len(queue)):
-        task = queue.popleft()
-        if task.ready_at <= now:
-            return task
-        queue.append(task)
-    return None
+    EntryScheduler(settings, all_pages, batches, progress_state, record_index,
+                   negative_index or NegativeCacheIndex()).run()
 
 
 def save_manifest_checkpoint(
@@ -1069,9 +972,10 @@ def save_manifest_checkpoint(
         f"rate={pages_per_second:.1f} pages/s, "
         f"batch_p50={batch_p50_text}, "
         f"retries={retry_count}, "
-        f"batch_failures={progress_state.failed_batch_attempts}, "
+        f"request_failures={progress_state.failed_batch_attempts}, "
         f"eta={format_duration(eta_seconds)}, "
-        f"elapsed={elapsed:.1f}s"
+        f"elapsed={elapsed:.1f}s, "
+        f"scheduler={json.dumps(progress_state.scheduler_metrics, separators=(',', ':'))}"
     )
     save_fetch_progress(
         settings,
@@ -1079,6 +983,7 @@ def save_manifest_checkpoint(
         current_concurrency=progress_state.current_concurrency,
         request_retries=retry_count,
         failed_batch_attempts=progress_state.failed_batch_attempts,
+        scheduler_metrics=progress_state.scheduler_metrics,
     )
     if negative_index is not None:
         save_negative_cache(settings, negative_index)
@@ -1100,6 +1005,7 @@ def save_fetch_progress(
     current_concurrency: int,
     request_retries: int,
     failed_batch_attempts: int,
+    scheduler_metrics: dict[str, Any] | None = None,
 ) -> None:
     settings.cache_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_text(
@@ -1111,6 +1017,7 @@ def save_fetch_progress(
                 "current_concurrency": current_concurrency,
                 "request_retries": request_retries,
                 "failed_batch_attempts": failed_batch_attempts,
+                "scheduler": scheduler_metrics or {},
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -1167,6 +1074,17 @@ def fetch_batch_with_session(
         right_records = fetch_batch_with_session(session, settings, batch[midpoint:])
         return left_records + right_records
 
+    records = records_from_extract_payload(settings, batch, payload, use_pageids=use_pageids)
+    for record in records:
+        if record is not None and summary_may_list_links(record.summary):
+            record.listed_links = fetch_listed_links(session, settings, record.canonical_title)
+    return records
+
+
+def records_from_extract_payload(
+    settings: Settings, batch: list[ManifestPage], payload: dict, *, use_pageids: bool,
+) -> list[SummaryRecord | None]:
+    """Validate and convert a complete extract response without network side effects."""
     query = validate_api_payload(payload)["query"]
     normalized_map = {item["from"]: item["to"] for item in query.get("normalized", [])}
     redirect_map = {item["from"]: item["to"] for item in query.get("redirects", [])}
@@ -1222,8 +1140,6 @@ def fetch_batch_with_session(
         title = payload_page["title"]
         article_url = requested_page.source_url
         listed_links = []
-        if summary_may_list_links(summary):
-            listed_links = fetch_listed_links(session, settings, title)
         records.append(
             SummaryRecord(
                 pageid=pageid,
@@ -1311,20 +1227,35 @@ def validate_api_payload(payload: Any) -> dict:
 
 
 def request_api_payload(session: requests.Session, settings: Settings, payload: dict) -> dict:
-    last_error: requests.RequestException | None = None
-    for url in host_fallback_candidates(settings.extracts_api_url):
+    """Synchronous helper for direct callers; the entry scheduler never calls this."""
+    from .scheduler import api_attempt, PermanentApiError, ThrottledApiError
+
+    urls = host_fallback_candidates(settings.extracts_api_url)
+    endpoint = 0
+    rejected: set[str] = set()
+    for attempt in range(settings.retry_attempts):
         try:
-            response = request_with_retry(session, url, settings, method="POST", data=payload)
-            try:
-                result = response.json()
-            except ValueError as exc:
-                raise ApiResponseError("API response was not valid JSON") from exc
-            return validate_api_payload(result)
+            return api_attempt(settings, urls[endpoint], payload, session=session)
         except requests.RequestException as exc:
-            last_error = exc
-    if last_error is not None:
-        raise last_error
-    raise ApiResponseError("No API endpoint was available")
+            response = exc.response
+            status = response.status_code if response is not None else None
+            rejected.add(urls[endpoint])
+            throttled = status == 429 or isinstance(exc, ThrottledApiError)
+            can_fallback = len(urls) > 1 and urls[1 - endpoint] not in rejected
+            if (isinstance(exc, PermanentApiError) or status in {413, 414, 431}
+                    or (status is not None and status not in {429, 500, 502, 503, 504, 403, 404}
+                        and not isinstance(exc, ApiResponseError))
+                    or (status in {403, 404} and not can_fallback)
+                    or attempt + 1 >= settings.retry_attempts):
+                raise
+            if not throttled and len(urls) > 1:
+                endpoint = 1 - endpoint
+            delay = min(30.0, settings.backoff_base_seconds * 2 ** min(attempt, 30))
+            if response is not None:
+                delay = max(delay, retry_after_seconds(response.headers.get("Retry-After")))
+            record_request_retry()
+            time.sleep(delay)
+    raise RuntimeError("Entry API attempt budget exhausted")
 
 
 def fetch_extract_payload(
@@ -1589,34 +1520,6 @@ def format_request_error(error: requests.RequestException) -> str:
     if not message:
         message = "<no message>"
     return f"{type(error).__name__}{status}: {message}"
-
-
-def adaptive_state_after_failure(settings: Settings, state: AdaptiveState) -> AdaptiveState:
-    reduced_concurrency = max(settings.min_concurrency, state.current_concurrency - 1)
-    next_cooldown = settings.backoff_base_seconds if state.cooldown_seconds <= 0 else min(
-        settings.adaptive_backoff_cap_seconds,
-        state.cooldown_seconds * 2,
-    )
-    return AdaptiveState(
-        current_concurrency=reduced_concurrency,
-        consecutive_successes=0,
-        cooldown_seconds=next_cooldown,
-    )
-
-
-def adaptive_state_after_success(settings: Settings, state: AdaptiveState) -> AdaptiveState:
-    consecutive_successes = state.consecutive_successes + 1
-    current_concurrency = state.current_concurrency
-    if consecutive_successes >= 2 and current_concurrency < settings.concurrency:
-        current_concurrency += 1
-        consecutive_successes = 0
-
-    cooldown_seconds = 0.0 if state.cooldown_seconds <= settings.backoff_base_seconds else state.cooldown_seconds / 2
-    return AdaptiveState(
-        current_concurrency=current_concurrency,
-        consecutive_successes=consecutive_successes,
-        cooldown_seconds=cooldown_seconds,
-    )
 
 
 def sitemap_url_candidates(url: str) -> list[str]:

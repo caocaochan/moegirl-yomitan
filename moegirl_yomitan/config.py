@@ -33,7 +33,7 @@ class Settings:
     chunk_size: int = 10_000
     request_timeout: TimeoutType = (30.0, 180.0)
     retry_attempts: int = 5
-    batch_retry_attempts: int = 3
+    batch_retry_attempts: int = 3  # Deprecated compatibility field; entry retries use retry_attempts.
     backoff_base_seconds: float = 1.0
     adaptive_backoff_cap_seconds: float = 30.0
     user_agent: str = "moegirl-yomitan-builder/0.1 (+non-commercial summary builder)"

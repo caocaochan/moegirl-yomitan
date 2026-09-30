@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from moegirl_yomitan import scheduler
+
 import json
 import subprocess
 import time
@@ -351,7 +353,7 @@ def test_malformed_record_cache_index_falls_back_to_record_files(tmp_path: Path,
     assert index.count == 1
 
 
-def test_fetch_pages_reuses_cached_record_when_manifest_is_incomplete(tmp_path: Path, monkeypatch) -> None:
+def test_fetch_pages_reuses_cached_record_when_manifest_is_incomplete(tmp_path: Path, monkeypatch, mock_batches) -> None:
     settings = Settings(cache_dir=tmp_path / "cache", batch_size=1, concurrency=1)
     initial_record = make_record()
 
@@ -368,7 +370,7 @@ def test_fetch_pages_reuses_cached_record_when_manifest_is_incomplete(tmp_path: 
         return [initial_record]
 
     monkeypatch.setattr(fetcher, "discover_pages", fake_discover_pages)
-    monkeypatch.setattr(fetcher, "fetch_batch", fake_fetch_batch)
+    mock_batches(fake_fetch_batch)
 
     first_pages = fetch_pages(settings, limit=1)
     assert len(fetch_calls) == 1
@@ -385,7 +387,7 @@ def test_fetch_pages_reuses_cached_record_when_manifest_is_incomplete(tmp_path: 
     def fail_fetch_batch(settings: Settings, batch: list[ManifestPage]) -> list[SummaryRecord | None]:
         raise AssertionError("cached record should have prevented a refetch")
 
-    monkeypatch.setattr(fetcher, "fetch_batch", fail_fetch_batch)
+    mock_batches(fail_fetch_batch)
 
     second_pages = fetch_pages(settings, limit=1)
 
@@ -394,7 +396,7 @@ def test_fetch_pages_reuses_cached_record_when_manifest_is_incomplete(tmp_path: 
     assert progress["pages_pending_fetch"] == 0
 
 
-def test_fetch_pages_second_run_keeps_cached_record_mtime(tmp_path: Path, monkeypatch) -> None:
+def test_fetch_pages_second_run_keeps_cached_record_mtime(tmp_path: Path, monkeypatch, mock_batches) -> None:
     settings = Settings(cache_dir=tmp_path / "cache", batch_size=1, concurrency=1)
     initial_record = make_record()
 
@@ -409,7 +411,7 @@ def test_fetch_pages_second_run_keeps_cached_record_mtime(tmp_path: Path, monkey
         return [initial_record]
 
     monkeypatch.setattr(fetcher, "discover_pages", fake_discover_pages)
-    monkeypatch.setattr(fetcher, "fetch_batch", fake_fetch_batch)
+    mock_batches(fake_fetch_batch)
 
     fetch_pages(settings, limit=1)
     record_path = record_path_for_page(settings, initial_record.pageid)
@@ -420,7 +422,7 @@ def test_fetch_pages_second_run_keeps_cached_record_mtime(tmp_path: Path, monkey
     def fail_fetch_batch(settings: Settings, batch: list[ManifestPage]) -> list[SummaryRecord | None]:
         raise AssertionError("identical second run should not refetch")
 
-    monkeypatch.setattr(fetcher, "fetch_batch", fail_fetch_batch)
+    mock_batches(fail_fetch_batch)
 
     fetch_pages(settings, limit=1)
 
@@ -428,7 +430,7 @@ def test_fetch_pages_second_run_keeps_cached_record_mtime(tmp_path: Path, monkey
     assert record_path.stat().st_mtime_ns == first_mtime
 
 
-def test_full_fetch_and_package_retain_entries_removed_from_sitemap(tmp_path: Path, monkeypatch) -> None:
+def test_full_fetch_and_package_retain_entries_removed_from_sitemap(tmp_path: Path, monkeypatch, mock_batches) -> None:
     settings = Settings(
         cache_dir=tmp_path / "cache",
         output_zip=tmp_path / "dist" / "moegirl.zip",
@@ -480,7 +482,7 @@ def test_full_fetch_and_package_retain_entries_removed_from_sitemap(tmp_path: Pa
         return [records_by_title[page.title_from_url] for page in batch]
 
     monkeypatch.setattr(fetcher, "fetch_sitemap_text_with_fallback", fake_fetch_sitemap_text_with_fallback)
-    monkeypatch.setattr(fetcher, "fetch_batch", fake_fetch_batch)
+    mock_batches(fake_fetch_batch)
 
     first_pages = fetch_pages(settings)
     assert {page.canonical_title for page in first_pages} == {"甲", "乙"}
@@ -504,6 +506,12 @@ def test_fetch_extract_payload_uses_post(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class DummyResponse:
+        def raise_for_status(self):
+            pass
+
+        def close(self):
+            pass
+
         def json(self) -> dict:
             return {"query": {"pages": {}}}
 
@@ -513,9 +521,11 @@ def test_fetch_extract_payload_uses_post(monkeypatch) -> None:
         captured["data"] = data
         return DummyResponse()
 
-    monkeypatch.setattr(fetcher, "request_with_retry", fake_request_with_retry)
+    class Session:
+        def request(self, method, url, data, timeout):
+            return fake_request_with_retry(self, url, settings, method=method, data=data)
 
-    payload = fetcher.fetch_extract_payload(object(), settings, ["萌娘", "舰队Collection"])
+    payload = fetcher.fetch_extract_payload(Session(), settings, ["萌娘", "舰队Collection"])
 
     assert payload == {"query": {"pages": {}}}
     assert captured["method"] == "POST"
@@ -950,7 +960,7 @@ def test_fetch_batch_reuses_one_session_per_thread(monkeypatch) -> None:
     assert created_sessions[0].close_calls == 1
 
 
-def test_run_adaptive_fetch_loop_closes_batch_worker_sessions(monkeypatch) -> None:
+def test_run_adaptive_fetch_loop_closes_batch_worker_sessions(monkeypatch, mock_batches) -> None:
     settings = Settings(cache_dir=Path("unused-cache"), batch_size=1, concurrency=1)
     pages = [make_page_with_title("甲"), make_page_with_title("乙")]
     batches = [[pages[0]], [pages[1]]]
@@ -982,7 +992,7 @@ def test_run_adaptive_fetch_loop_closes_batch_worker_sessions(monkeypatch) -> No
     )
 
     monkeypatch.setattr(fetcher, "build_session", fake_build_session)
-    monkeypatch.setattr(fetcher, "fetch_batch_with_session", fake_fetch_batch_with_session)
+    mock_batches(lambda settings, batch: fake_fetch_batch_with_session(None, settings, batch))
     monkeypatch.setattr(fetcher, "write_record", lambda settings, record: None)
     monkeypatch.setattr(fetcher, "save_manifest_checkpoint", lambda *args, **kwargs: None)
 
@@ -1065,7 +1075,7 @@ def test_fetch_sitemaps_in_parallel_closes_worker_sessions(monkeypatch) -> None:
     assert created_sessions[0].close_calls == 1
 
 
-def test_fetch_pages_uses_lightweight_periodic_checkpoints(tmp_path: Path, monkeypatch) -> None:
+def test_fetch_pages_uses_lightweight_periodic_checkpoints(tmp_path: Path, monkeypatch, mock_batches) -> None:
     settings = Settings(cache_dir=tmp_path / "cache", batch_size=1, concurrency=1)
     pages = [make_page_with_title(f"page-{index}") for index in range(101)]
     saved_progress: list[dict[str, int]] = []
@@ -1085,7 +1095,7 @@ def test_fetch_pages_uses_lightweight_periodic_checkpoints(tmp_path: Path, monke
     def fake_fetch_batch(settings: Settings, batch: list[ManifestPage]) -> list[SummaryRecord | None]:
         return [make_record_for_page(batch[0], pageid=int(batch[0].title_from_url.split("-")[-1]) + 1)]
 
-    monkeypatch.setattr(fetcher, "fetch_batch", fake_fetch_batch)
+    mock_batches(fake_fetch_batch)
 
     fetch_pages(settings, limit=len(pages))
 
@@ -1096,7 +1106,7 @@ def test_fetch_pages_uses_lightweight_periodic_checkpoints(tmp_path: Path, monke
     assert [progress["batches_completed"] for progress in lightweight_progress] == [0, 100, 101]
 
 
-def test_fetch_pages_final_checkpoint_is_written(tmp_path: Path, monkeypatch) -> None:
+def test_fetch_pages_final_checkpoint_is_written(tmp_path: Path, monkeypatch, mock_batches) -> None:
     settings = Settings(cache_dir=tmp_path / "cache", batch_size=1, concurrency=1)
     page = make_page()
     saved_progress: list[dict[str, int]] = []
@@ -1106,7 +1116,7 @@ def test_fetch_pages_final_checkpoint_is_written(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr(fetcher, "save_manifest", lambda settings, pages, progress=None: saved_progress.append(progress or {}))
     monkeypatch.setattr(fetcher, "write_record", lambda settings, record: None)
     monkeypatch.setattr(fetcher, "log_status", lambda message: None)
-    monkeypatch.setattr(fetcher, "fetch_batch", lambda settings, batch: [make_record_for_page(batch[0], pageid=1)])
+    mock_batches(lambda settings, batch: [make_record_for_page(batch[0], pageid=1)])
 
     fetch_pages(settings, limit=1)
 
@@ -1115,7 +1125,7 @@ def test_fetch_pages_final_checkpoint_is_written(tmp_path: Path, monkeypatch) ->
     assert saved_progress[-1]["pages_pending_fetch"] == 0
 
 
-def test_fetch_pages_does_not_rebuild_record_index_after_fetch(tmp_path: Path, monkeypatch) -> None:
+def test_fetch_pages_does_not_rebuild_record_index_after_fetch(tmp_path: Path, monkeypatch, mock_batches) -> None:
     settings = Settings(cache_dir=tmp_path / "cache", batch_size=1, concurrency=1)
     page = make_page()
     build_calls = 0
@@ -1124,7 +1134,7 @@ def test_fetch_pages_does_not_rebuild_record_index_after_fetch(tmp_path: Path, m
     monkeypatch.setattr(fetcher, "save_manifest", lambda settings, pages, progress=None: None)
     monkeypatch.setattr(fetcher, "write_record", lambda settings, record: None)
     monkeypatch.setattr(fetcher, "log_status", lambda message: None)
-    monkeypatch.setattr(fetcher, "fetch_batch", lambda settings, batch: [make_record_for_page(batch[0], pageid=1)])
+    mock_batches(lambda settings, batch: [make_record_for_page(batch[0], pageid=1)])
 
     def fake_build_record_cache_index(settings: Settings) -> fetcher.RecordCacheIndex:
         nonlocal build_calls
@@ -1138,7 +1148,7 @@ def test_fetch_pages_does_not_rebuild_record_index_after_fetch(tmp_path: Path, m
     assert build_calls == 1
 
 
-def test_fetch_pages_progress_counters_match_written_records(tmp_path: Path, monkeypatch) -> None:
+def test_fetch_pages_progress_counters_match_written_records(tmp_path: Path, monkeypatch, mock_batches) -> None:
     settings = Settings(cache_dir=tmp_path / "cache", batch_size=2, concurrency=1)
     pages = [make_page_with_title("甲"), make_page_with_title("乙")]
     saved_progress: list[dict[str, int]] = []
@@ -1147,11 +1157,7 @@ def test_fetch_pages_progress_counters_match_written_records(tmp_path: Path, mon
     monkeypatch.setattr(fetcher, "save_manifest", lambda settings, pages, progress=None: saved_progress.append(progress or {}))
     monkeypatch.setattr(fetcher, "write_record", lambda settings, record: None)
     monkeypatch.setattr(fetcher, "log_status", lambda message: None)
-    monkeypatch.setattr(
-        fetcher,
-        "fetch_batch",
-        lambda settings, batch: [make_record_for_page(batch[0], pageid=10), None],
-    )
+    mock_batches(lambda settings, batch: [make_record_for_page(batch[0], pageid=10), None])
 
     fetch_pages(settings, limit=2)
 
@@ -1162,7 +1168,7 @@ def test_fetch_pages_progress_counters_match_written_records(tmp_path: Path, mon
     assert final_progress["pages_pending_fetch"] == 0
 
 
-def test_fetch_pages_emits_periodic_status_updates(tmp_path: Path, monkeypatch) -> None:
+def test_fetch_pages_emits_periodic_status_updates(tmp_path: Path, monkeypatch, mock_batches) -> None:
     settings = Settings(cache_dir=tmp_path / "cache", batch_size=1, concurrency=1)
     page = make_page()
     messages: list[str] = []
@@ -1171,7 +1177,7 @@ def test_fetch_pages_emits_periodic_status_updates(tmp_path: Path, monkeypatch) 
     monkeypatch.setattr(fetcher, "save_manifest", lambda settings, pages, progress=None: None)
     monkeypatch.setattr(fetcher, "write_record", lambda settings, record: None)
     monkeypatch.setattr(fetcher, "log_status", messages.append)
-    monkeypatch.setattr(fetcher, "fetch_batch", lambda settings, batch: [make_record_for_page(batch[0], pageid=1)])
+    mock_batches(lambda settings, batch: [make_record_for_page(batch[0], pageid=1)])
 
     result = fetch_pages(settings, limit=1)
 
