@@ -12,6 +12,8 @@ def normalize_whitespace(text: str) -> str:
 
 
 def trim_summary(text: str, limit: int) -> str:
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("summary limit must be a positive integer")
     text = normalize_whitespace(text)
     if len(text) <= limit:
         return text
@@ -28,5 +30,5 @@ def trim_summary(text: str, limit: int) -> str:
     if whitespace_position >= floor:
         return cutoff[:whitespace_position].rstrip() + "…"
 
-    hard_limit = max(1, limit - 1)
+    hard_limit = max(0, limit - 1)
     return cutoff[:hard_limit].rstrip() + "…"

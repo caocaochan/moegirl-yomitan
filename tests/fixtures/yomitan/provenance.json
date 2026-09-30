@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/yomidevs/yomitan",
+  "commit": "c33853250917cabab7a93a5bd8712894ca32a2ce",
+  "files": {
+    "dictionary-index-schema.json": {
+      "url": "https://raw.githubusercontent.com/yomidevs/yomitan/c33853250917cabab7a93a5bd8712894ca32a2ce/ext/data/schemas/dictionary-index-schema.json",
+      "sha256": "dde43ca9ef1580ab638f49bb13bd7d5c55646afd655ff99cf429492598feb69b"
+    },
+    "dictionary-term-bank-v3-schema.json": {
+      "url": "https://raw.githubusercontent.com/yomidevs/yomitan/c33853250917cabab7a93a5bd8712894ca32a2ce/ext/data/schemas/dictionary-term-bank-v3-schema.json",
+      "sha256": "665904fcaac715a018a7df6b49d3ace08390d614a9da4f62222bce32c8030b87"
+    },
+    "LICENSE": {
+      "url": "https://raw.githubusercontent.com/yomidevs/yomitan/c33853250917cabab7a93a5bd8712894ca32a2ce/LICENSE",
+      "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+    }
+  }
+}

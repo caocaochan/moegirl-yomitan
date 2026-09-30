@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 import sys
 
@@ -12,8 +13,8 @@ from .release_diff import build_release_diff_html
 
 def positive_float(value: str) -> float:
     parsed = float(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be greater than 0")
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be finite and greater than 0")
     return parsed
 
 
@@ -53,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     diff_parser = subparsers.add_parser("diff-releases")
     diff_parser.add_argument("--head-version", required=True, help="Build version represented by the local head archive.")
     diff_parser.add_argument("--head-zip", type=Path, required=True, help="Local dictionary archive for the head build.")
+    diff_parser.add_argument("--output", type=Path, help="Write UTF-8 HTML to this file instead of stdout.")
 
     save_state_parser = subparsers.add_parser("save-build-state")
     add_common_arguments(save_state_parser)
@@ -64,12 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cache-dir", type=Path, default=Settings.cache_dir)
     parser.add_argument("--output", type=Path, default=Settings.output_zip)
-    parser.add_argument("--limit", type=int, default=None, help="Limit the number of discovered pages for smaller runs.")
-    parser.add_argument("--summary-char-limit", type=int, default=Settings.summary_char_limit)
+    parser.add_argument("--limit", type=positive_int, default=None, help="Limit discovery; replaces the cache manifest with this subset.")
+    parser.add_argument("--summary-char-limit", type=positive_int, default=Settings.summary_char_limit)
     parser.add_argument("--batch-size", type=extract_batch_size, default=Settings.batch_size)
-    parser.add_argument("--concurrency", type=int, default=Settings.concurrency)
-    parser.add_argument("--sitemap-concurrency", type=int, default=Settings.sitemap_concurrency)
-    parser.add_argument("--chunk-size", type=int, default=Settings.chunk_size)
+    parser.add_argument("--concurrency", type=positive_int, default=Settings.concurrency)
+    parser.add_argument("--sitemap-concurrency", type=positive_int, default=Settings.sitemap_concurrency)
+    parser.add_argument("--chunk-size", type=positive_int, default=Settings.chunk_size)
     parser.add_argument("--retry-attempts", type=positive_int, default=Settings.retry_attempts)
     parser.add_argument("--request-timeout", type=positive_float, default=Settings.request_timeout[1])
     parser.add_argument("--backoff-base-seconds", type=positive_float, default=Settings.backoff_base_seconds)
@@ -95,7 +97,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "diff-releases":
-        print(build_release_diff_html(head_version=args.head_version, head_zip=args.head_zip))
+        html = build_release_diff_html(head_version=args.head_version, head_zip=args.head_zip)
+        if args.output is None:
+            print(html)
+        else:
+            from .fetcher import atomic_write_text
+
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(args.output, html)
         return 0
 
     settings = settings_from_args(args)

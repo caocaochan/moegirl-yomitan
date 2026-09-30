@@ -88,7 +88,7 @@ set "DIFF_URL=https://github.com/caocaochan/moegirl-yomitan/releases/download/%B
 >> "%RELEASE_NOTES%" echo Entries added: %DIFF_URL%
 
 echo Generating release entry diff HTML...
-python -m moegirl_yomitan diff-releases --head-version "%BUILD_VERSION%" --head-zip "dist\moegirl-yomitan.zip" > "%DIFF_HTML%"
+python -m moegirl_yomitan diff-releases --head-version "%BUILD_VERSION%" --head-zip "dist\moegirl-yomitan.zip" --output "%DIFF_HTML%"
 if errorlevel 1 exit /b 1
 
 if not exist "%DIFF_HTML%" (

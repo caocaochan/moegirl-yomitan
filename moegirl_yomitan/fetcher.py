@@ -5,6 +5,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 import json
 from pathlib import Path
@@ -36,8 +37,8 @@ ATOMIC_WRITE_REPLACE_ATTEMPTS = 5
 ATOMIC_WRITE_RETRY_SECONDS = 0.05
 SESSION_POOL_BATCH = "batch"
 SESSION_POOL_SITEMAP = "sitemap"
-RECORD_CACHE_INDEX_SCHEMA_VERSION = 2
-NEGATIVE_CACHE_SCHEMA_VERSION = 1
+RECORD_CACHE_INDEX_SCHEMA_VERSION = 3
+NEGATIVE_CACHE_SCHEMA_VERSION = 2
 
 _THREAD_LOCAL = threading.local()
 _ACTIVE_SESSION_REGISTRIES: dict[str, list["SessionRegistry"]] = {
@@ -47,6 +48,10 @@ _ACTIVE_SESSION_REGISTRIES: dict[str, list["SessionRegistry"]] = {
 _ACTIVE_SESSION_REGISTRIES_LOCK = threading.Lock()
 _REQUEST_METRICS_LOCK = threading.Lock()
 _REQUEST_RETRY_COUNT = 0
+
+
+class ApiResponseError(requests.RequestException):
+    """An API response that cannot establish a missing or empty page."""
 
 
 def build_session(settings: Settings) -> requests.Session:
@@ -80,6 +85,8 @@ class CachedRecord:
     record_path: str
     file_size: int
     file_mtime_ns: int
+    summary_char_limit: int = Settings.summary_char_limit
+    summary_complete: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CachedRecord" | None:
@@ -103,6 +110,10 @@ class CachedRecord:
             return None
         if not isinstance(file_size, int) or not isinstance(file_mtime_ns, int):
             return None
+        summary_char_limit = data.get("summary_char_limit", Settings.summary_char_limit)
+        summary_complete = data.get("summary_complete", False)
+        if type(summary_char_limit) is not int or summary_char_limit <= 0 or type(summary_complete) is not bool:
+            return None
         return cls(
             record_schema_version=record_schema_version,
             pageid=pageid,
@@ -113,6 +124,8 @@ class CachedRecord:
             record_path=record_path,
             file_size=file_size,
             file_mtime_ns=file_mtime_ns,
+            summary_char_limit=summary_char_limit,
+            summary_complete=summary_complete,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -126,6 +139,8 @@ class CachedRecord:
             "record_path": self.record_path,
             "file_size": self.file_size,
             "file_mtime_ns": self.file_mtime_ns,
+            "summary_char_limit": self.summary_char_limit,
+            "summary_complete": self.summary_complete,
         }
 
 
@@ -446,11 +461,23 @@ def save_manifest(settings: Settings, pages: Iterable[ManifestPage], progress: d
     )
 
 
-def load_record(record_path: Path) -> SummaryRecord | None:
-    if not record_path.exists():
+def load_record(record_path: Path, *, strict: bool = False) -> SummaryRecord | None:
+    try:
+        data = json.loads(record_path.read_text(encoding="utf-8"))
+        record = SummaryRecord.from_dict(data)
+        if record_path.stem.isdigit() and int(record_path.stem) != record.pageid:
+            raise ValueError("record pageid does not match its filename")
+        return record
+    except FileNotFoundError:
+        if strict:
+            raise ValueError(f"Missing cached record: {record_path}; run fetch to repair the cache") from None
         return None
-    data = json.loads(record_path.read_text(encoding="utf-8"))
-    return SummaryRecord.from_dict(data)
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
+        message = f"Unusable cached record: {record_path}: {exc}; run fetch to repair the cache"
+        if strict:
+            raise ValueError(message) from exc
+        log_status(message)
+        return None
 
 
 def record_path_for_page(settings: Settings, pageid: int) -> Path:
@@ -473,6 +500,8 @@ def cached_record_from_record(settings: Settings, record: SummaryRecord, record_
         record_path=record_relative_path(settings, record_path),
         file_size=record_stat.st_size,
         file_mtime_ns=record_stat.st_mtime_ns,
+        summary_char_limit=record.summary_char_limit or Settings.summary_char_limit,
+        summary_complete=record.summary_complete,
     )
 
 
@@ -558,7 +587,7 @@ def load_negative_cache(settings: Settings) -> NegativeCacheIndex:
     except (OSError, json.JSONDecodeError):
         return NegativeCacheIndex()
     if not isinstance(data, dict) or data.get("schema_version") != NEGATIVE_CACHE_SCHEMA_VERSION:
-        return NegativeCacheIndex()
+        return NegativeCacheIndex(dirty=True)
 
     raw_entries = data.get("entries")
     if not isinstance(raw_entries, dict):
@@ -759,6 +788,9 @@ def hydrate_page_from_record(settings: Settings, page: ManifestPage, record: Cac
     if page.record_path != record.record_path:
         page.record_path = record.record_path
         changed = True
+    if page.fetched_lastmod is None and record.lastmod == page.lastmod:
+        page.fetched_lastmod = record.lastmod
+        changed = True
 
     return changed
 
@@ -782,16 +814,23 @@ def page_needs_fetch(
     page: ManifestPage,
     record: CachedRecord | None,
     negative_entry: NegativeCacheEntry | None = None,
+    *,
+    summary_char_limit: int = Settings.summary_char_limit,
 ) -> bool:
+    if (
+        negative_entry is not None
+        and negative_entry.record_schema_version == SUMMARY_RECORD_SCHEMA_VERSION
+        and negative_entry.lastmod == page.lastmod
+    ):
+        return False
     if record is None:
-        return not (
-            negative_entry is not None
-            and negative_entry.record_schema_version == SUMMARY_RECORD_SCHEMA_VERSION
-            and negative_entry.lastmod == page.lastmod
-        )
+        return True
     if record.record_schema_version != SUMMARY_RECORD_SCHEMA_VERSION:
         return True
-    if record.lastmod != page.lastmod:
+    fetched_lastmod = page.fetched_lastmod if page.fetched_lastmod is not None else record.lastmod
+    if fetched_lastmod != page.lastmod:
+        return True
+    if summary_char_limit > record.summary_char_limit and not record.summary_complete:
         return True
     if page.canonical_title and record.canonical_title != page.canonical_title:
         return True
@@ -815,6 +854,8 @@ def build_progress(
 
 
 def fetch_pages(settings: Settings, limit: int | None = None) -> list[ManifestPage]:
+    if limit is not None and (type(limit) is not int or limit <= 0):
+        raise ValueError("limit must be a positive integer")
     if not 1 <= settings.batch_size <= MAX_EXTRACT_BATCH_SIZE:
         raise ValueError(
             f"batch_size must be between 1 and {MAX_EXTRACT_BATCH_SIZE}; the extracts API returns no more than "
@@ -848,6 +889,7 @@ def fetch_pages(settings: Settings, limit: int | None = None) -> list[ManifestPa
             page,
             record_for_page(page, record_index),
             negative_index.by_source_url.get(page.source_url),
+            summary_char_limit=settings.summary_char_limit,
         )
     ]
 
@@ -931,6 +973,8 @@ def run_adaptive_fetch_loop(
                 batch_elapsed = time.monotonic() - submitted_at
                 try:
                     records = future.result()
+                    if len(records) != len(task.pages):
+                        raise ApiResponseError("Batch result omitted requested pages")
                 except requests.RequestException as exc:
                     state = adaptive_state_after_failure(settings, state)
                     progress_state.current_concurrency = state.current_concurrency
@@ -951,6 +995,7 @@ def run_adaptive_fetch_loop(
                 for page, record in zip(task.pages, records):
                     if record is None:
                         mark_negative_cache_entry(negative_index, page)
+                        page.fetched_lastmod = ""
                         continue
                     clear_negative_cache_entry(negative_index, page.source_url)
                     is_new_pageid = record.pageid not in record_index.by_pageid
@@ -960,6 +1005,7 @@ def run_adaptive_fetch_loop(
                     page.canonical_title = record.canonical_title
                     page.article_url = record.article_url
                     page.record_path = record_path_for_page(settings, record.pageid).relative_to(settings.cache_dir).as_posix()
+                    page.fetched_lastmod = page.lastmod
                     progress_state.records_fetched += 1
                     if is_new_pageid:
                         progress_state.new_pageids_seen.add(record.pageid)
@@ -1104,8 +1150,11 @@ def fetch_batch_with_session(
 ) -> list[SummaryRecord | None]:
     titles = [page.title_from_url for page in batch]
     pageids = [page.pageid for page in batch if page.pageid is not None]
+    use_pageids = bool(batch) and len(pageids) == len(batch) and all(
+        page.canonical_title == page.title_from_url.replace("_", " ") for page in batch
+    )
     try:
-        if batch and len(pageids) == len(batch):
+        if use_pageids:
             payload = fetch_extract_payload(session, settings, [], pageids=pageids)
         else:
             payload = fetch_extract_payload(session, settings, titles)
@@ -1118,13 +1167,18 @@ def fetch_batch_with_session(
         right_records = fetch_batch_with_session(session, settings, batch[midpoint:])
         return left_records + right_records
 
-    query = payload.get("query", {})
+    query = validate_api_payload(payload)["query"]
     normalized_map = {item["from"]: item["to"] for item in query.get("normalized", [])}
     redirect_map = {item["from"]: item["to"] for item in query.get("redirects", [])}
     pages_by_title = {}
     pages_by_pageid: dict[int, dict[str, Any]] = {}
+    missing_titles: set[str] = set()
+    missing_pageids: set[int] = set()
     for value in query.get("pages", {}).values():
         if "missing" in value:
+            missing_titles.add(value.get("title", ""))
+            if "pageid" in value:
+                missing_pageids.add(value["pageid"])
             continue
         pages_by_title[value["title"]] = value
         if "pageid" in value:
@@ -1132,18 +1186,32 @@ def fetch_batch_with_session(
 
     records: list[SummaryRecord | None] = []
     for requested_page in batch:
-        payload_page = pages_by_pageid.get(requested_page.pageid) if requested_page.pageid is not None else None
+        candidates = [requested_page.title_from_url]
+        if use_pageids and requested_page.canonical_title:
+            candidates.append(requested_page.canonical_title)
+        resolved_titles = []
+        for candidate in candidates:
+            resolved_title = normalized_map.get(candidate, candidate)
+            seen_titles: set[str] = set()
+            while resolved_title in redirect_map:
+                if resolved_title in seen_titles:
+                    raise ApiResponseError("Cyclic API redirect mapping")
+                seen_titles.add(resolved_title)
+                resolved_title = redirect_map[resolved_title]
+            resolved_titles.append(resolved_title)
+        payload_page = pages_by_pageid.get(requested_page.pageid) if use_pageids else None
         if payload_page is None:
-            resolved_title = normalized_map.get(requested_page.title_from_url, requested_page.title_from_url)
-            resolved_title = redirect_map.get(resolved_title, resolved_title)
-            payload_page = pages_by_title.get(resolved_title)
-            if payload_page is None:
-                payload_page = pages_by_title.get(requested_page.canonical_title or requested_page.title_from_url)
+            payload_page = next((pages_by_title[title] for title in resolved_titles if title in pages_by_title), None)
         if payload_page is None:
-            records.append(None)
-            continue
+            if any(title in missing_titles for title in resolved_titles) or requested_page.pageid in missing_pageids:
+                records.append(None)
+                continue
+            raise ApiResponseError(f"API response omitted requested page: {requested_page.title_from_url}")
 
-        extract = payload_page.get("extract", "")
+        extract = payload_page.get("extract")
+        if not isinstance(extract, str):
+            raise ApiResponseError(f"API response omitted extract for {payload_page['title']}")
+        extract = normalize_whitespace(extract)
         summary = trim_summary(extract, settings.summary_char_limit)
         summary = normalize_whitespace(summary)
         if not summary:
@@ -1166,6 +1234,8 @@ def fetch_batch_with_session(
                 summary=summary,
                 retrieved_at=utc_now_iso(),
                 listed_links=listed_links,
+                summary_char_limit=settings.summary_char_limit,
+                summary_complete=len(extract) <= settings.summary_char_limit,
             )
         )
     return records
@@ -1202,6 +1272,61 @@ def fetch_sitemap_worker(settings: Settings, url: str) -> str:
     return fetch_sitemap_text_with_fallback(session, url, settings)
 
 
+def validate_api_payload(payload: Any) -> dict:
+    if not isinstance(payload, dict):
+        raise ApiResponseError("API response must be an object")
+    if "error" in payload or "errors" in payload:
+        raise ApiResponseError(f"MediaWiki API error: {payload.get('error', payload.get('errors'))}")
+    query = payload.get("query")
+    if not isinstance(query, dict) or not isinstance(query.get("pages"), dict):
+        raise ApiResponseError("API response must contain query.pages")
+    for page in query["pages"].values():
+        if not isinstance(page, dict):
+            raise ApiResponseError("API page must be an object")
+        if "missing" in page:
+            if not isinstance(page.get("title"), str) and type(page.get("pageid")) is not int:
+                raise ApiResponseError("Missing API page has no identity")
+        elif (
+            type(page.get("pageid")) is not int or page["pageid"] <= 0
+            or not isinstance(page.get("title"), str) or not page["title"]
+        ):
+            raise ApiResponseError("API page has an invalid identity")
+        if "extract" in page and not isinstance(page["extract"], str):
+            raise ApiResponseError("API extract must be a string")
+    for name in ("normalized", "redirects"):
+        mappings = query.get(name, [])
+        if not isinstance(mappings, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("from"), str)
+            or not isinstance(item.get("to"), str) for item in mappings
+        ):
+            raise ApiResponseError(f"Invalid API {name} mappings")
+    if "continue" in payload:
+        continuation = payload["continue"]
+        if not isinstance(continuation, dict) or not continuation or any(
+            not isinstance(key, str) or type(value) not in (str, int)
+            for key, value in continuation.items()
+        ):
+            raise ApiResponseError("Invalid API continuation")
+    return payload
+
+
+def request_api_payload(session: requests.Session, settings: Settings, payload: dict) -> dict:
+    last_error: requests.RequestException | None = None
+    for url in host_fallback_candidates(settings.extracts_api_url):
+        try:
+            response = request_with_retry(session, url, settings, method="POST", data=payload)
+            try:
+                result = response.json()
+            except ValueError as exc:
+                raise ApiResponseError("API response was not valid JSON") from exc
+            return validate_api_payload(result)
+        except requests.RequestException as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise ApiResponseError("No API endpoint was available")
+
+
 def fetch_extract_payload(
     session: requests.Session,
     settings: Settings,
@@ -1219,6 +1344,7 @@ def fetch_extract_payload(
         "prop": "extracts",
         "exintro": "1",
         "explaintext": "1",
+        "exlimit": str(requested_count),
         "redirects": "1",
         "format": "json",
     }
@@ -1226,33 +1352,47 @@ def fetch_extract_payload(
         payload["pageids"] = "|".join(str(pageid) for pageid in pageids)
     else:
         payload["titles"] = "|".join(titles)
-    last_error: requests.RequestException | None = None
-    for url in host_fallback_candidates(settings.extracts_api_url):
-        try:
-            response = request_with_retry(session, url, settings, method="POST", data=payload)
-            return response.json()
-        except requests.RequestException as exc:
-            last_error = exc
-            continue
-    if last_error is not None:
-        raise last_error
-    raise requests.HTTPError(f"Unable to fetch extracts from any candidate for {settings.extracts_api_url}")
+    merged: dict[str, Any] = {"query": {"pages": {}}}
+    seen_continuations: set[str] = set()
+    for _ in range(requested_count + 1):
+        result = request_api_payload(session, settings, payload)
+        query = result["query"]
+        for pageid, page in query["pages"].items():
+            merged["query"]["pages"].setdefault(pageid, {}).update(page)
+        for name in ("normalized", "redirects"):
+            if name in query:
+                merged["query"].setdefault(name, []).extend(query[name])
+        continuation = result.get("continue")
+        if continuation is None:
+            return merged
+        token = json.dumps(continuation, sort_keys=True)
+        if "excontinue" not in continuation or token in seen_continuations:
+            raise ApiResponseError("Unfinished or repeated extract continuation")
+        seen_continuations.add(token)
+        payload.update(continuation)
+    raise ApiResponseError("Extract continuation exceeded the requested page count")
 
 
 def fetch_listed_links(session: requests.Session, settings: Settings, title: str) -> list[ListedLink]:
     extract_html = ""
     linked_titles: set[str] = set()
     continuation: dict[str, Any] | None = None
+    seen_continuations: set[str] = set()
+    saw_extract = False
 
     while True:
         payload = fetch_listed_links_payload(session, settings, title, continuation=continuation)
-        query = payload.get("query", {})
+        query = validate_api_payload(payload)["query"]
         pages = [value for value in query.get("pages", {}).values() if "missing" not in value]
         if pages:
             page = pages[0]
+            saw_extract = saw_extract or "extract" in page
             if not extract_html:
                 extract_html = page.get("extract", "")
-            for link in page.get("links", []):
+            page_links = page.get("links", [])
+            if not isinstance(page_links, list) or any(not isinstance(link, dict) for link in page_links):
+                raise ApiResponseError("API links must be a list of objects")
+            for link in page_links:
                 if link.get("ns") != 0:
                     continue
                 linked_title = link.get("title")
@@ -1260,10 +1400,16 @@ def fetch_listed_links(session: requests.Session, settings: Settings, title: str
                     linked_titles.add(linked_title)
 
         raw_continuation = payload.get("continue")
-        if not isinstance(raw_continuation, dict) or "plcontinue" not in raw_continuation:
+        if raw_continuation is None:
             break
+        token = json.dumps(raw_continuation, sort_keys=True)
+        if "plcontinue" not in raw_continuation or token in seen_continuations:
+            raise ApiResponseError("Unfinished or repeated link continuation")
+        seen_continuations.add(token)
         continuation = raw_continuation
 
+    if not saw_extract:
+        raise ApiResponseError(f"API response omitted HTML extract for {title}")
     if not extract_html or not linked_titles:
         return []
 
@@ -1295,17 +1441,7 @@ def fetch_listed_links_payload(
     if continuation:
         payload.update(continuation)
 
-    last_error: requests.RequestException | None = None
-    for url in host_fallback_candidates(settings.extracts_api_url):
-        try:
-            response = request_with_retry(session, url, settings, method="POST", data=payload)
-            return response.json()
-        except requests.RequestException as exc:
-            last_error = exc
-            continue
-    if last_error is not None:
-        raise last_error
-    raise requests.HTTPError(f"Unable to fetch listed links from any candidate for {settings.extracts_api_url}")
+    return request_api_payload(session, settings, payload)
 
 
 def fetch_text_with_retry(
@@ -1531,21 +1667,38 @@ def request_with_retry(
     data: dict[str, str] | None = None,
 ) -> requests.Response:
     for attempt in range(settings.retry_attempts):
+        response = None
         try:
             response = session.request(method, url, params=params, data=data, timeout=settings.request_timeout)
-            if response.status_code < 400:
-                return response
-            if response.status_code not in {429, 500, 502, 503, 504}:
-                response.raise_for_status()
-            if attempt == settings.retry_attempts - 1:
-                response.raise_for_status()
         except requests.RequestException:
             if attempt == settings.retry_attempts - 1:
                 raise
+        else:
+            if response.status_code < 400:
+                return response
+            if response.status_code not in {429, 500, 502, 503, 504} or attempt == settings.retry_attempts - 1:
+                response.raise_for_status()
         record_request_retry()
         sleep_seconds = settings.backoff_base_seconds * (2**attempt)
+        if response is not None:
+            sleep_seconds = max(sleep_seconds, retry_after_seconds(response.headers.get("Retry-After")))
+            response.close()
         time.sleep(sleep_seconds)
     raise RuntimeError(f"Failed to fetch {url}")
+
+
+def retry_after_seconds(value: str | None) -> float:
+    if not value:
+        return 0.0
+    try:
+        if value.strip().isdigit():
+            return float(value)
+        retry_at = parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+    except (ValueError, TypeError, OverflowError):
+        return 0.0
 
 
 def write_record(settings: Settings, record: SummaryRecord) -> None:
@@ -1553,7 +1706,10 @@ def write_record(settings: Settings, record: SummaryRecord) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(record.to_dict(), ensure_ascii=False, indent=2)
     if path.exists():
-        existing_text = path.read_text(encoding="utf-8")
+        try:
+            existing_text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            existing_text = ""
         if existing_text == payload:
             return
         try:

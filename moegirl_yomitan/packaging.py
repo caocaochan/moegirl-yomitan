@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from contextlib import contextmanager
 import hashlib
+from importlib.metadata import version
 import json
 from pathlib import Path
 import re
+import shutil
+import tempfile
 import time
 from typing import Callable, Any
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -14,6 +18,7 @@ from pypinyin import Style, lazy_pinyin
 from .config import Settings
 from .fetcher import atomic_write_text, load_manifest, load_record, record_path_for_page
 from .models import SummaryRecord
+from .text import trim_summary
 from .versioning import resolve_build_version
 
 PARENTHETICAL_ALIAS_PATTERN = re.compile(r"^(?P<base>.+?)(?:（[^（）()]+）|\([^（）()]+\))$")
@@ -25,9 +30,27 @@ READING_SPACE_AFTER_OPENING_PATTERN = re.compile(r"([(\[<{（【《「『])\s+")
 READING_PUNCTUATION_WITH_TRAILING_SPACE_PATTERN = re.compile(r"([,.:;!?:：；，。！？、])(?=\S)")
 STRUCTURED_CONTENT_LANG = "zh-Hans"
 BUILD_STATE_SCHEMA_VERSION = 2
-FINGERPRINT_ALGORITHM_VERSION = "packaged-content-v4"
+FINGERPRINT_ALGORITHM_VERSION = "packaged-content-v5"
 _PINYIN_DATA_READY = False
 ProgressReporter = Callable[[str], None]
+
+
+class PublicationRollbackError(OSError):
+    """Publication failed and backups must be kept for manual recovery."""
+
+
+@contextmanager
+def dictionary_staging(output_dir: Path):
+    stage_dir = Path(tempfile.mkdtemp(prefix=".moegirl-build-", dir=output_dir))
+    preserve_backups = False
+    try:
+        yield stage_dir
+    except PublicationRollbackError:
+        preserve_backups = True
+        raise
+    finally:
+        if not preserve_backups:
+            shutil.rmtree(stage_dir)
 
 
 @dataclass(frozen=True)
@@ -91,6 +114,8 @@ class DictionaryFingerprintResult:
 
 def package_dictionary(settings: Settings, progress: ProgressReporter | None = None) -> Path:
     ordered_records = load_packaged_records(settings)
+    if not ordered_records:
+        raise ValueError("No usable records to package; run fetch before building a dictionary")
     report_progress(progress, f"Loaded {len(ordered_records)} packaged records.")
     build_version = resolve_build_version()
     index_data = build_index(settings, revision=build_version)
@@ -99,33 +124,94 @@ def package_dictionary(settings: Settings, progress: ProgressReporter | None = N
     settings.output_zip.parent.mkdir(parents=True, exist_ok=True)
     settings.output_index.parent.mkdir(parents=True, exist_ok=True)
     report_progress(progress, f"Writing standalone index to {settings.output_index}.")
-    settings.output_index.write_text(serialized_index, encoding="utf-8")
     record_chunks = chunked(ordered_records, settings.chunk_size)
-    with ZipFile(settings.output_zip, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
-        archive.writestr("index.json", serialized_index)
-        for file_number, chunk in enumerate(record_chunks, start=1):
-            report_progress(
-                progress,
-                f"Writing term_bank_{file_number}.json ({len(chunk)} records, {file_number}/{len(record_chunks)}).",
-            )
-            entries = [entry for record in chunk for entry in build_term_entries(record)]
-            archive.writestr(
-                f"term_bank_{file_number}.json",
-                json.dumps(entries, ensure_ascii=False, separators=(",", ":")),
-            )
+    with dictionary_staging(settings.output_zip.parent) as stage_dir:
+        stage_zip = stage_dir / "dictionary.zip"
+        stage_index = stage_dir / "index.json"
+        stage_index.write_bytes(serialized_index.encode("utf-8"))
+        with ZipFile(stage_zip, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
+            archive.writestr("index.json", serialized_index)
+            for file_number, chunk in enumerate(record_chunks, start=1):
+                report_progress(
+                    progress,
+                    f"Writing term_bank_{file_number}.json ({len(chunk)} records, {file_number}/{len(record_chunks)}).",
+                )
+                entries = [entry for record in chunk for entry in build_term_entries(record)]
+                archive.writestr(
+                    f"term_bank_{file_number}.json",
+                    json.dumps(entries, ensure_ascii=False, separators=(",", ":")),
+                )
+        with ZipFile(stage_zip) as archive:
+            if archive.testzip() is not None or archive.read("index.json") != stage_index.read_bytes():
+                raise ValueError("Staged dictionary assets failed verification")
+            for file_number in range(1, len(record_chunks) + 1):
+                entries = json.loads(archive.read(f"term_bank_{file_number}.json"))
+                if not isinstance(entries, list) or not entries:
+                    raise ValueError("Staged term bank is empty or invalid")
+        publish_dictionary_assets(settings, stage_zip, stage_index)
     report_progress(progress, f"Wrote dictionary archive to {settings.output_zip}.")
     return settings.output_zip
+
+
+def publish_dictionary_assets(settings: Settings, stage_zip: Path, stage_index: Path) -> None:
+    """Roll back caught publication failures after staging both assets."""
+    assets = ((stage_zip, settings.output_zip), (stage_index, settings.output_index))
+    backups: dict[Path, Path] = {}
+    for index, (_, target) in enumerate(assets):
+        if target.exists():
+            backup = stage_zip.parent / f"previous-{index}"
+            shutil.copy2(target, backup)
+            backups[target] = backup
+    published: list[Path] = []
+    try:
+        for staged, target in assets:
+            staged.replace(target)
+            published.append(target)
+    except BaseException as publication_error:
+        rollback_errors = []
+        for target in reversed(published):
+            try:
+                if target in backups:
+                    backups[target].replace(target)
+                else:
+                    target.unlink()
+            except OSError as exc:
+                rollback_errors.append(f"{target}: {exc}")
+        if rollback_errors:
+            raise PublicationRollbackError(
+                f"Could not restore dictionary assets ({'; '.join(rollback_errors)}). "
+                f"Recovery files are preserved at {stage_zip.parent}"
+            ) from publication_error
+        raise
+
+
+def record_is_current(page, record: SummaryRecord) -> bool:
+    if record.pageid != page.pageid:
+        raise ValueError(f"Cached record identity does not match {page.record_path}; run fetch to repair the cache")
+    fetched_lastmod = page.fetched_lastmod if page.fetched_lastmod is not None else record.lastmod
+    return fetched_lastmod == page.lastmod
+
+
+def prepare_packaged_record(settings: Settings, record: SummaryRecord) -> SummaryRecord:
+    cached_limit = record.summary_char_limit or Settings.summary_char_limit
+    if settings.summary_char_limit > cached_limit and not record.summary_complete:
+        raise ValueError(
+            f"Cached summary for {record.canonical_title} was limited to {cached_limit} characters; "
+            f"run fetch --summary-char-limit {settings.summary_char_limit} before packaging"
+        )
+    return replace(record, summary=trim_summary(record.summary, settings.summary_char_limit))
 
 
 def load_packaged_records(settings: Settings) -> list[SummaryRecord]:
     manifest_pages = load_manifest(settings)
     deduped: dict[int, SummaryRecord] = {}
     for page in manifest_pages:
-        if page.pageid is None:
+        if page.pageid is None or (page.fetched_lastmod is not None and page.fetched_lastmod != page.lastmod):
             continue
-        record = load_record(packaged_record_path(settings, page))
-        if record is None or record.lastmod != page.lastmod:
+        record = load_record(packaged_record_path(settings, page), strict=True)
+        if not record_is_current(page, record):
             continue
+        record = prepare_packaged_record(settings, record)
         existing = deduped.get(record.pageid)
         if existing is None or (record.canonical_title, record.pageid) < (existing.canonical_title, existing.pageid):
             deduped[record.pageid] = record
@@ -151,16 +237,20 @@ def build_dictionary_content_fingerprint_result(
     reused_records = 0
     recomputed_records = 0
 
-    can_reuse_previous = previous_state.get("algorithm_version") == FINGERPRINT_ALGORITHM_VERSION
+    can_reuse_previous = (
+        previous_state.get("algorithm_version") == FINGERPRINT_ALGORITHM_VERSION
+        and previous_state.get("pinyin_versions") == pinyin_dependency_versions()
+        and previous_state.get("summary_char_limit") == settings.summary_char_limit
+    )
     for processed, page in enumerate(manifest_pages, start=1):
-        if page.pageid is None:
+        if page.pageid is None or (page.fetched_lastmod is not None and page.fetched_lastmod != page.lastmod):
             continue
 
         record_path = packaged_record_path(settings, page)
         try:
             record_stat = record_path.stat()
-        except OSError:
-            continue
+        except OSError as exc:
+            raise ValueError(f"Cannot read cached record: {record_path}; run fetch to repair the cache") from exc
 
         relative_record_path = packaged_record_relative_path(settings, record_path)
         cached = previous_records.get(str(page.pageid)) if can_reuse_previous else None
@@ -169,13 +259,14 @@ def build_dictionary_content_fingerprint_result(
             entry = cached
             reused_records += 1
         else:
-            record = load_record(record_path)
-            if record is None or record.lastmod != page.lastmod:
+            record = load_record(record_path, strict=True)
+            if not record_is_current(page, record):
                 continue
+            record = prepare_packaged_record(settings, record)
             entry = PackagedRecordFingerprint(
                 pageid=record.pageid,
                 canonical_title=record.canonical_title,
-                lastmod=record.lastmod,
+                lastmod=page.lastmod,
                 record_path=relative_record_path,
                 file_size=record_stat.st_size,
                 file_mtime_ns=record_stat.st_mtime_ns,
@@ -236,6 +327,7 @@ def cached_matches_page(
 ) -> bool:
     return (
         cached.pageid == page.pageid
+        and (page.fetched_lastmod is None or page.fetched_lastmod == page.lastmod)
         and cached.lastmod == page.lastmod
         and cached.record_path == relative_record_path
         and cached.file_size == record_stat.st_size
@@ -256,12 +348,17 @@ def build_packaged_record_fingerprint(record: SummaryRecord) -> str:
 def compose_dictionary_content_fingerprint(settings: Settings, records: list[PackagedRecordFingerprint]) -> str:
     payload = {
         "algorithm_version": FINGERPRINT_ALGORITHM_VERSION,
+        "pinyin_versions": pinyin_dependency_versions(),
         "chunk_size": settings.chunk_size,
         "index": build_stable_index_data(settings),
         "records": [{"pageid": record.pageid, "fingerprint": record.fingerprint} for record in records],
     }
     serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def pinyin_dependency_versions() -> dict[str, str]:
+    return {name: version(name) for name in ("pypinyin", "pypinyin-dict")}
 
 
 def packaged_record_path(settings: Settings, page) -> Path:
@@ -324,6 +421,8 @@ def save_build_state(settings: Settings, fingerprint: str, progress: ProgressRep
             {
                 "schema_version": BUILD_STATE_SCHEMA_VERSION,
                 "algorithm_version": FINGERPRINT_ALGORITHM_VERSION,
+                "pinyin_versions": pinyin_dependency_versions(),
+                "summary_char_limit": settings.summary_char_limit,
                 "content_fingerprint": fingerprint,
                 "record_fingerprints": {str(record.pageid): record.to_dict() for record in result.records},
             },

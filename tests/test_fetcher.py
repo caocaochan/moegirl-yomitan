@@ -612,8 +612,8 @@ def test_fetch_listed_links_filters_broad_page_links_and_preserves_list_order(mo
 
     assert calls == [None, {"plcontinue": "246707|0|日向花火(火影忍者)", "continue": "||"}]
     assert links == [
-        ListedLink(title="日向花火(火影忍者)", url="https://mzh.moegirl.org.cn/日向花火(火影忍者)"),
-        ListedLink(title="日向花火(Tropical KISS)", url="https://mzh.moegirl.org.cn/日向花火(Tropical KISS)"),
+        ListedLink(title="日向花火(火影忍者)", url="https://mzh.moegirl.org.cn/%E6%97%A5%E5%90%91%E8%8A%B1%E7%81%AB(%E7%81%AB%E5%BD%B1%E5%BF%8D%E8%80%85)"),
+        ListedLink(title="日向花火(Tropical KISS)", url="https://mzh.moegirl.org.cn/%E6%97%A5%E5%90%91%E8%8A%B1%E7%81%AB(Tropical_KISS)"),
     ]
 
 
@@ -873,6 +873,7 @@ def test_fetch_batch_split_preserves_none_placeholders(monkeypatch) -> None:
         pages_payload: dict[str, dict] = {}
         for index, title in enumerate(titles, start=1):
             if title == "乙":
+                pages_payload["-1"] = {"title": title, "missing": ""}
                 continue
             extract = "" if title == "丁" else f"{title} 摘要"
             pages_payload[str(index)] = {

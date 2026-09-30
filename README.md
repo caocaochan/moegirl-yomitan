@@ -14,7 +14,7 @@ python -m moegirl_yomitan package
 Useful options:
 
 ```bash
-python -m moegirl_yomitan build --limit 100
+python -m moegirl_yomitan build --limit 100 --cache-dir .cache/sample --output dist/sample/moegirl-yomitan.zip
 python -m moegirl_yomitan build --batch-size 1 --concurrency 4
 python -m moegirl_yomitan build --from-cache --output dist/moegirl-yomitan.zip
 python -m moegirl_yomitan fetch --cache-dir .cache/moegirl-yomitan
@@ -26,6 +26,28 @@ python -m moegirl_yomitan package --output dist/moegirl-yomitan.zip
 rejecting long requests, lower `--batch-size` first.
 `build --from-cache` rebuilds the Yomitan archive from the current local cache only and
 does not download or refresh entries.
+
+`--limit` replaces the selected cache's manifest with the discovered subset. Use a
+separate `--cache-dir` and an output in a separate directory for sample runs; the
+standalone update index uses a fixed filename beside the archive.
+
+Cached summaries record their extraction limit and whether the complete lead was
+retained. Smaller `--summary-char-limit` values work offline without rewriting the
+cache. Larger values require `fetch --summary-char-limit <limit>` when the cached
+lead was truncated. Legacy records without this metadata are treated as having
+the original 240-character limit; custom limits used by older versions cannot be
+inferred from those records.
+
+Malformed record files are reported and refetched. Packaging stops on damaged or
+missing referenced records and on builds with no usable entries. ZIP and index
+assets are staged and verified before publication; caught replacement failures
+roll back the previous outputs. If rollback is blocked, the error identifies a
+staging directory containing the recovery files. File replacements are atomic
+individually, but a process or power interruption between them is not transactional.
+
+The next fetch ignores old negative-cache outcomes and retries those pages once.
+Successful cached records remain available. Redirect freshness is stored per
+source URL so aliases can share a summary without repeated fetching.
 
 ## Build versioning
 
@@ -72,7 +94,30 @@ Publish the stable release assets with GitHub CLI:
 gh release create "<version>" "dist/moegirl-yomitan.zip" "dist/moegirl-yomitan-index.json" --title "<version>" --notes "Manual Yomitan dictionary build for version <version>."
 ```
 
+The Windows release script writes release-diff HTML as UTF-8 using
+`diff-releases --output <path>`. Release discovery follows all GitHub release
+pages with bounded request timeouts. A first dictionary release lists all entries
+as additions.
+
 For Yomitan imports that can self-update, use this URL so the extension always checks the
 latest release asset:
 
 `https://github.com/caocaochan/moegirl-yomitan/releases/latest/download/moegirl-yomitan.zip`
+
+## Validation
+
+Install the development dependencies and run the offline suite:
+
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest -q -k "not smoke_build_and_package"
+```
+
+CI runs this suite on pull requests and pushes, on Windows/Linux with Python
+3.10 and 3.12. Unit tests reject unexpected network requests. The optional
+`test_smoke_build_and_package` test contacts the live wiki.
+
+Official Yomitan schemas are vendored in `tests/fixtures/yomitan`; provenance
+records the upstream commit, URLs, and SHA-256 hashes, with the upstream license.
+Pinyin dependency versions participate in fingerprint-cache compatibility so an
+upgrade recomputes packaged fingerprints.

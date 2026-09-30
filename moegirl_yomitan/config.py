@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Union
 
@@ -36,6 +37,33 @@ class Settings:
     backoff_base_seconds: float = 1.0
     adaptive_backoff_cap_seconds: float = 30.0
     user_agent: str = "moegirl-yomitan-builder/0.1 (+non-commercial summary builder)"
+
+    def __post_init__(self) -> None:
+        for name in (
+            "summary_char_limit", "batch_size", "concurrency", "min_concurrency",
+            "sitemap_concurrency", "chunk_size", "retry_attempts", "batch_retry_attempts",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.batch_size > MAX_EXTRACT_BATCH_SIZE:
+            raise ValueError(f"batch_size must be at most {MAX_EXTRACT_BATCH_SIZE}")
+        if self.min_concurrency > self.concurrency:
+            raise ValueError("min_concurrency must not exceed concurrency")
+        for name in ("backoff_base_seconds", "adaptive_backoff_cap_seconds"):
+            self._validate_positive_float(name, getattr(self, name))
+        timeouts = self.request_timeout if isinstance(self.request_timeout, tuple) else (self.request_timeout,)
+        if isinstance(self.request_timeout, tuple) and len(timeouts) != 2:
+            raise ValueError("request_timeout must be a number or a (connect, read) pair")
+        for timeout in timeouts:
+            self._validate_positive_float("request_timeout", timeout)
+        if self.output_zip == self.output_index:
+            raise ValueError("output_zip and output_index must have different paths")
+
+    @staticmethod
+    def _validate_positive_float(name: str, value: float) -> None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and greater than 0")
 
     @property
     def manifest_path(self) -> Path:

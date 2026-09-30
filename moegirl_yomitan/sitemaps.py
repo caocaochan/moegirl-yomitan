@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Iterable
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 import re
 import xml.etree.ElementTree as ET
 
@@ -82,9 +82,7 @@ def rewrite_to_mzh(url: str) -> str:
 
 
 def canonical_article_url(title: str) -> str:
-    # Preserve MediaWiki path semantics while ensuring non-ASCII characters are encoded.
-    split = urlsplit(f"https://mzh.moegirl.org.cn/{title}")
-    return urlunsplit((split.scheme, split.netloc, split.path, split.query, split.fragment))
+    return "https://mzh.moegirl.org.cn/" + quote(title.replace(" ", "_"), safe="/():")
 
 
 def merge_manifest_pages(
@@ -103,6 +101,7 @@ def merge_manifest_pages(
             page.canonical_title = previous.canonical_title
             page.article_url = previous.article_url
             page.record_path = previous.record_path
+            page.fetched_lastmod = previous.fetched_lastmod
         merged.append(page)
     if retain_previous:
         merged.extend(page for source_url, page in previous_pages.items() if source_url not in current_source_urls)

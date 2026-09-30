@@ -439,10 +439,7 @@ def validate_against_official_schema(index_data: dict, term_data: list) -> None:
     import jsonschema
 
     index_schema = load_official_index_schema()
-    term_schema = requests.get(
-        "https://raw.githubusercontent.com/yomidevs/yomitan/refs/heads/master/ext/data/schemas/dictionary-term-bank-v3-schema.json",
-        timeout=30,
-    ).json()
+    term_schema = load_official_schema("dictionary-term-bank-v3-schema.json")
 
     jsonschema.validate(index_data, index_schema)
     jsonschema.validate(term_data, term_schema)
@@ -455,10 +452,11 @@ def validate_index_against_official_schema(index_data: dict) -> None:
 
 
 def load_official_index_schema() -> dict:
-    return requests.get(
-        "https://raw.githubusercontent.com/yomidevs/yomitan/refs/heads/master/ext/data/schemas/dictionary-index-schema.json",
-        timeout=30,
-    ).json()
+    return load_official_schema("dictionary-index-schema.json")
+
+
+def load_official_schema(name: str) -> dict:
+    return json.loads((Path(__file__).parent / "fixtures" / "yomitan" / name).read_text(encoding="utf-8"))
 
 
 def write_single_page_cache(

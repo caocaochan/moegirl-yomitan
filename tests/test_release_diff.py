@@ -79,17 +79,16 @@ def test_select_base_dictionary_release_uses_highest_lower_semantic_version() ->
     assert base.tag_name == "2026.06.05.2"
 
 
-def test_select_base_dictionary_release_requires_an_earlier_dictionary_release() -> None:
-    with pytest.raises(ValueError, match="No published dictionary release exists before 2026.06.20"):
-        select_base_dictionary_release(
-            [
-                make_release("2026.06.20"),
-                make_release("2026.06.19", draft=True),
-                make_release("2026.06.18", asset_name="other.zip"),
-                make_release("invalid"),
-            ],
-            head_version="2026.06.20",
-        )
+def test_select_base_dictionary_release_allows_an_empty_baseline() -> None:
+    assert select_base_dictionary_release(
+        [
+            make_release("2026.06.20"),
+            make_release("2026.06.19", draft=True),
+            make_release("2026.06.18", asset_name="other.zip"),
+            make_release("invalid"),
+        ],
+        head_version="2026.06.20",
+    ) is None
 
 
 def test_build_release_diff_html_uses_local_head_zip(tmp_path, monkeypatch) -> None:

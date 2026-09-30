@@ -7,6 +7,9 @@ def test_github_workflow_validates_without_fetching_or_releasing() -> None:
 
     assert "name: Validate" in workflow
     assert "contents: read" in workflow
+    assert "pull_request:" in workflow
+    assert "os: [ubuntu-latest, windows-latest]" in workflow
+    assert 'python-version: ["3.10", "3.12"]' in workflow
     assert 'pytest -q -k "not smoke_build_and_package"' in workflow
     assert "schedule:" not in workflow
     assert "actions/cache" not in workflow
@@ -36,3 +39,5 @@ def test_release_script_saves_build_state_after_successful_release() -> None:
     assert 'gh release create "%BUILD_VERSION%" "dist\\moegirl-yomitan.zip" "dist\\moegirl-yomitan-index.json" "%DIFF_HTML%" --title "%BUILD_VERSION%" --notes-file "%RELEASE_NOTES%"' in release_script
     assert 'gh release upload "%BUILD_VERSION%" "%DIFF_HTML%"' not in release_script
     assert 'save-build-state --fingerprint "%FINGERPRINT%"' in release_script
+    assert '--output "%DIFF_HTML%"' in release_script
+    assert '> "%DIFF_HTML%"' not in release_script

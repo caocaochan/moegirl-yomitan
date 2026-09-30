@@ -16,6 +16,7 @@ from .versioning import BUILD_VERSION_PATTERN
 GITHUB_REPOSITORY = "caocaochan/moegirl-yomitan"
 DICTIONARY_ASSET_NAME = "moegirl-yomitan.zip"
 USER_AGENT = "moegirl-yomitan-builder/0.1 (+release diff)"
+REQUEST_TIMEOUT = (30.0, 180.0)
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,7 @@ class ReleaseEntry:
 
 @dataclass(frozen=True)
 class ReleaseEntryDiff:
-    base: ReleaseAsset
+    base: ReleaseAsset | None
     head: ReleaseAsset
     added: list[ReleaseEntry]
 
@@ -49,7 +50,7 @@ def build_release_diff_html(*, head_version: str, head_zip: Path) -> str:
     try:
         releases = fetch_github_releases(session)
         base = select_base_dictionary_release(releases, head_version=head_version)
-        base_entries = load_release_entries(download_release_asset(session, base))
+        base_entries = load_release_entries(download_release_asset(session, base)) if base is not None else {}
         head_entries = load_release_entries(head_zip.read_bytes())
     finally:
         session.close()
@@ -71,15 +72,24 @@ def build_release_diff_html(*, head_version: str, head_zip: Path) -> str:
 
 
 def fetch_github_releases(session: requests.Session) -> list[dict[str, Any]]:
-    response = session.get(f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases", params={"per_page": "100"})
-    response.raise_for_status()
-    data = response.json()
-    if not isinstance(data, list):
-        raise ValueError("GitHub releases response was not a list.")
-    return data
+    releases: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        response = session.get(
+            f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases",
+            params={"per_page": "100", "page": str(page)}, timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, list) or any(not isinstance(release, dict) for release in data):
+            raise ValueError("GitHub releases response was not a list of objects.")
+        releases.extend(data)
+        if len(data) < 100:
+            return releases
+        page += 1
 
 
-def select_base_dictionary_release(releases: list[dict[str, Any]], *, head_version: str) -> ReleaseAsset:
+def select_base_dictionary_release(releases: list[dict[str, Any]], *, head_version: str) -> ReleaseAsset | None:
     head_key = build_version_sort_key(head_version)
     if head_key is None:
         raise ValueError(f"Invalid build version: {head_version}")
@@ -101,7 +111,7 @@ def select_base_dictionary_release(releases: list[dict[str, Any]], *, head_versi
         candidates.append((version_key, asset))
 
     if not candidates:
-        raise ValueError(f"No published dictionary release exists before {head_version}.")
+        return None
     return max(candidates, key=lambda candidate: candidate[0])[1]
 
 
@@ -136,7 +146,7 @@ def release_asset_from_release(release: dict[str, Any]) -> ReleaseAsset:
 
 
 def download_release_asset(session: requests.Session, release: ReleaseAsset) -> bytes:
-    response = session.get(release.download_url)
+    response = session.get(release.download_url, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     return response.content
 
@@ -177,7 +187,7 @@ def release_entry_from_term_entry(raw_entry: Any) -> ReleaseEntry | None:
     return ReleaseEntry(
         pageid=pageid,
         title=title,
-        article_url=extract_first_href(raw_entry[5]) if len(raw_entry) > 5 else None,
+        article_url=extract_original_article_href(raw_entry[5]),
         score=score,
     )
 
@@ -186,18 +196,18 @@ def entry_sort_key(entry: ReleaseEntry) -> tuple[int, str]:
     return (-entry.score, entry.title.casefold())
 
 
-def extract_first_href(value: Any) -> str | None:
+def extract_original_article_href(value: Any) -> str | None:
     if isinstance(value, dict):
         href = value.get("href")
-        if isinstance(href, str) and href:
+        if value.get("tag") == "a" and isinstance(href, str) and href and value.get("content") in (["查看原文"], "查看原文"):
             return href
         for child in value.values():
-            found = extract_first_href(child)
+            found = extract_original_article_href(child)
             if found is not None:
                 return found
     elif isinstance(value, list):
         for child in value:
-            found = extract_first_href(child)
+            found = extract_original_article_href(child)
             if found is not None:
                 return found
     return None
@@ -228,6 +238,7 @@ def render_release_diff_html(diff: ReleaseEntryDiff) -> str:
         (
             f'<p>Compared <a href="{escape(diff.base.html_url, quote=True)}">{escape(diff.base.tag_name)}</a> '
             f'to <a href="{escape(diff.head.html_url, quote=True)}">{escape(diff.head.tag_name)}</a>.</p>'
+            if diff.base is not None else '<p>First dictionary release; all entries are new.</p>'
         ),
         f"<p>Added entries: {len(diff.added)}</p>",
     ]
